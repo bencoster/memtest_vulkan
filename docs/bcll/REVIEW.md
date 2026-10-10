@@ -244,3 +244,22 @@ is limited to where the per-run supervisor lives.
 | R20 | P2 | `main.rs:866-871`, `507-520` | No `maxStorageBufferRange` / re-queried requirements (Codex F5). |
 | R21 | P2 | `main.rs:570-585` | Budget arithmetic overestimates the remaining process budget (Codex F6). |
 | R22 | P2 | `main.rs:1916-1919` | The parent's exit code drops the child's result bits (Codex F7). |
+
+## 11. Codex review of this branch: BLOCK 89de0c26 (at 14109d2) and its resolution
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | Supervision unbounded: kill/wait, pipe joins, codec discovery, telemetry join, driver queries in the supervisor; no parent-death containment | New `proc.rs`: every wait bounded; kill → bounded death wait with explicit `dead_confirmed` / kill error; pipes drained on detached threads with bounded collection; Windows kill-on-close Job Object / Linux `PR_SET_PDEATHSIG`. Inventory, snapshots and telemetry moved into worker processes (`query.rs`); the supervisor makes no driver call. Every worker, including the upstream child, has its own hard deadline. Tests: fake kill failure, delayed / too-slow death, stalled pipe, real timeout kill, a grandchild holding stdout, bounded background stop. |
+| 2 | Vulkan workers (and the upstream child) receive only an ordinal | Workers receive the full PCI id + UUID and re-resolve with `select::pick_by_identity` before creating a device. The upstream child is guarded by `hooks::identity_ok` (`EXPECT_PCI` / `EXPECT_UUID`). Tests: reordered, reduced, swapped-board, zero-PCI and duplicate enumerations; identity-mismatch → init stop. |
+| 3 | Unknown safety evidence treated as permission | `display_from`: attached if either query says so, detached only if both say no, otherwise unknown. `compute_pids: Option`: a failed query is unknown. The gate refuses unknown usage, process list or display without the matching override. Tests cover each partial-failure combination. |
+| 4 | Transfer worker lacks device memory dependencies | `transfer_barrier` (TRANSFER\|HOST → TRANSFER, TRANSFER_WRITE/READ\|HOST_WRITE → TRANSFER_READ\|WRITE) at the start of the fill, H2D and D2H submissions. Source/spec fix; needs the live run for runtime evidence. |
+| 5 | Recorded mismatches downgraded by a later fault; CUDA unfinished-pass evidence lost | `judge::latch_mismatches`: any recorded mismatch → FAIL, with the later fault kept in `message` and `termination`. The memtest judge records its end reason separately. The CUDA worker emits exact `cuda_op_errors`; `cuda_error_count` counts unfinished-pass op and canary evidence exactly once. |
+| 6 | All-unsupported codec run = PASS; discovery failure collapsed into "unsupported" | `decide` requires at least one `pass`. Codec discovery is bounded and judged (`discovery_result`): failure → `error`, not `unsupported`. |
+| 7 | "nvidia-smi index" was a PCI-sorted Vulkan index | The bare index resolves through NVML's own index, joined by PCI id; refused without NVML. `--list` shows the smi column. Output has `nvml_index`; `index_pci_order` is documented as informational. |
+| 8 | Output write failure still exited 0; refusals wrote no output; fixed temp name | `finish_report → Result`: failure → exit 4 (verdict still printed). Refusals and errors write output (`refusal` / `error`, verdict null). A stale file is deleted before the run (refuse if that fails). Unique temp name, removed on failure. Tests: unwritable destination, no leftover temp file, refusal file contents and exit codes. Verified on the rig: stale-file replacement (exit 3) and a missing directory (exit 4). |
+| note | Shared `--work-dir` shares names; `free_bytes_at_start` sampled after the run; NVAPI bus-only match and bare-name DLL loads | Unique `bcll-run-<pid>-<nanos>` directory even under `--work-dir`. Occupancy is captured in the BEFORE snapshot. NVAPI requires an unambiguous bus match (slot used only to disambiguate, else refused). NVML / NVAPI / CUDA libraries load from `%SystemRoot%\\System32` explicitly. |
+
+Verification limits:
+- Linux was type-checked (`cargo check --target x86_64-unknown-linux-gnu --all-targets`, `-D warnings`)
+  but not linked or run: there is no Linux linker on this host.
+- No GPU workload was run. The barrier and identity paths need the documented live run.

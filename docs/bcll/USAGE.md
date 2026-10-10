@@ -41,8 +41,11 @@ Runtime requirements:
 Linux behaviour differences:
 - The NVAPI junction temperature is not available (see §6).
 - PCIe AER counters are read from sysfs.
-- Without a display there is no driver watchdog, so a hung kernel is caught only by the orchestrator's
-  worker deadline (`--worker-grace-s`).
+- Without a display there is no driver watchdog, so a hung kernel is caught by:
+  - the supervisor's worker deadline (`--worker-grace-s`), which kills the worker and *confirms* its
+    death or says it could not
+  - the worker's own hard deadline
+  - `PR_SET_PDEATHSIG` if the supervisor itself dies
 
 ### Cargo features
 
@@ -70,7 +73,7 @@ NVAPI thermal read. They are safe on live, busy and display cards, like `nvidia-
 
 | Form | Meaning |
 |---|---|
-| `0`..`N`, `index:N` | PCI bus order: the **nvidia-smi index**, which is what BC_LocalLLM calls GPU N |
+| `0`..`N`, `index:N` | the **nvidia-smi index** (read from NVML by PCI id), which is what BC_LocalLLM calls GPU N. Refused without NVML: use PCI/UUID instead. |
 | `0000:81:00.0`, `81:00.0` | PCI address |
 | `GPU-6727…` | UUID or unique prefix |
 | `vk:N` | upstream label |
@@ -92,9 +95,12 @@ Upstream's labels do *not* match nvidia-smi. On this rig `vk:3` is GPU 1, the di
 | Condition | Refused unless |
 |---|---|
 | a display is attached | `--allow-display` |
-| display state unknown (no NVML) | `--allow-display` |
+| display state unknown (no NVML, or a display query failed) | `--allow-display` |
 | more than `--max-used-mb` (default 1024) VRAM in use | `--allow-busy` |
 | compute processes present | `--allow-busy` |
+| VRAM usage / compute-process list unknown (query failed) | `--allow-busy` |
+
+A refusal with `--report-json` still writes the output file, with `refusal` set and verdict null.
 
 **Output:**
 - console: upstream progress lines, plus one telemetry line every `--telemetry-print-s` (10 s), plus a
@@ -110,8 +116,11 @@ Upstream's labels do *not* match nvidia-smi. On this rig `vk:3` is GPU 1, the di
 | 0 | PASS |
 | 1 | FAIL |
 | 2 | INCOMPLETE |
-| 3 | refused / usage |
-| 4 | internal error |
+| 3 | refused / usage (output written with `refusal`) |
+| 4 | operational error, including "requested output file could not be written" (verdict still printed) |
+
+A previous output file at the `--report-json` path is deleted before the run starts. If it cannot be
+deleted, the run is refused (exit 4).
 
 **Telemetry line:**
 

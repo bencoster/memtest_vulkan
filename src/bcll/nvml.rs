@@ -5,7 +5,7 @@
 //! fails the whole snapshot. Row-remapper calls go through the raw symbol table
 //! because nvml-wrapper 0.13 does not wrap them.
 
-use super::telemetry::{HealthSnapshot, Sample};
+use super::telemetry::{HealthSnapshot, Sample, Usage, display_from};
 use nvml_wrapper::{
     Device, Nvml,
     enum_wrappers::device::{
@@ -21,15 +21,6 @@ use std::collections::BTreeMap;
 
 pub struct NvmlCtx {
     nvml: Nvml,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Usage {
-    pub total_bytes: u64,
-    pub used_bytes: u64,
-    pub free_bytes: u64,
-    pub reserved_bytes: Option<u64>,
-    pub compute_pids: Vec<u32>,
 }
 
 fn put<T: serde::Serialize, E>(m: &mut Map<String, Value>, key: &str, r: Result<T, E>) {
@@ -90,7 +81,15 @@ struct RemapHistogram {
 
 impl NvmlCtx {
     pub fn open() -> Result<Self, String> {
-        Nvml::init()
+        // load the driver's copy explicitly (System32 on Windows), not via the search path
+        let lib = super::system_library(if cfg!(windows) {
+            "nvml.dll"
+        } else {
+            "libnvidia-ml.so.1"
+        });
+        Nvml::builder()
+            .lib_path(std::ffi::OsStr::new(&lib))
+            .init()
             .map(|nvml| NvmlCtx { nvml })
             .map_err(|e| format!("NVML unavailable: {e}"))
     }
@@ -130,12 +129,12 @@ impl NvmlCtx {
 
     pub fn display_attached(&self, pci_bus_id: &str) -> Option<bool> {
         let d = self.device(pci_bus_id)?;
-        match (d.is_display_active(), d.is_display_connected()) {
-            (Ok(a), Ok(c)) => Some(a || c),
-            (Ok(true), _) | (_, Ok(true)) => Some(true),
-            (Ok(false), Err(_)) | (Err(_), Ok(false)) => Some(false),
-            _ => None,
-        }
+        display_from(d.is_display_active().ok(), d.is_display_connected().ok())
+    }
+
+    /// nvidia-smi index of the device at this PCI id.
+    pub fn index(&self, pci_bus_id: &str) -> Option<u32> {
+        self.device(pci_bus_id)?.index().ok()
     }
 
     pub fn usage(&self, pci_bus_id: &str) -> Option<Usage> {
@@ -149,7 +148,8 @@ impl NvmlCtx {
                     .map(|p| p.pid)
                     .collect()
             })
-            .unwrap_or_default();
+            // a failed process query is UNKNOWN, never "no processes" (BLOCK 89de0c26 #3)
+            .ok();
         Some(Usage {
             total_bytes: mem.total,
             used_bytes: mem.used,

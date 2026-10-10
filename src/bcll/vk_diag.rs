@@ -8,7 +8,7 @@ use super::cli::{WorkerArgs, WorkerKind};
 use super::compute_ref;
 use super::events::EventWriter;
 use super::shaders;
-use super::vk_gpu::{Buf, Gpu, GpuFault, host_read_barrier, time_seed, vkr};
+use super::vk_gpu::{Buf, Gpu, GpuFault, host_read_barrier, time_seed, transfer_barrier, vkr};
 use byte_strings::c_str;
 use erupt::vk;
 use serde_json::json;
@@ -31,14 +31,16 @@ const TRANSFER_ROUNDS_PER_SEED: u32 = 8;
 
 pub fn run_worker(args: &WorkerArgs) -> i32 {
     let mut ev = EventWriter::create(&args.events);
-    let Some(vk_index) = args.vk_index else {
-        ev.emit("worker_error", json!({"message": "--vk-index required"}));
-        return EXIT_INTERNAL;
-    };
-    let gpu = match Gpu::open(vk_index) {
+    super::proc::arm_self_deadline(args.hard_deadline_s, EXIT_INCOMPLETE, &args.events);
+    let pci = args.pci.as_deref().unwrap_or_default();
+    let gpu = match Gpu::open(pci, args.uuid.as_deref()) {
         Ok(g) => g,
         Err(e) => {
-            ev.emit("worker_error", json!({"message": e.to_string()}));
+            let identity = matches!(e, GpuFault::Identity(_));
+            ev.emit(
+                "worker_error",
+                json!({"message": e.to_string(), "identity_mismatch": identity}),
+            );
             return EXIT_INTERNAL;
         }
     };
@@ -46,7 +48,7 @@ pub fn run_worker(args: &WorkerArgs) -> i32 {
     let result = match args.kind {
         WorkerKind::Compute => compute(&gpu, &mut ev, deadline),
         WorkerKind::Transfer => transfer(&gpu, &mut ev, deadline),
-        WorkerKind::CudaMemtest => unreachable!("routed to the cuda worker"),
+        _ => unreachable!("only compute/transfer are routed here"),
     };
     match result {
         Ok(errors) => {
@@ -344,13 +346,16 @@ fn transfer(gpu: &Gpu, ev: &mut EventWriter, deadline: Instant) -> Result<u64, G
                 round += 1;
                 // poison the device copy so a silently skipped H2D cannot pass
                 gpu.submit_wait("fill device buffer", |d, cmd| unsafe {
+                    transfer_barrier(d, cmd); // prior D2H read of `dev` before overwriting it
                     d.cmd_fill_buffer(cmd, dev.buffer, 0, vk::WHOLE_SIZE, 0xDEAD_BEEF);
                 })?;
                 let h2d = gpu.submit_wait("copy host->device", |d, cmd| unsafe {
+                    transfer_barrier(d, cmd); // fill write (WAW) + host writes of `src`
                     d.cmd_copy_buffer(cmd, src.buffer, dev.buffer, &region);
                 })?;
                 unsafe { std::ptr::write_bytes(dst.mapped, 0, TRANSFER_BYTES as usize) };
                 let d2h = gpu.submit_wait("copy device->host", |d, cmd| unsafe {
+                    transfer_barrier(d, cmd); // H2D write of `dev` -> this read; host zeroing of `dst`
                     d.cmd_copy_buffer(cmd, dev.buffer, dst.buffer, &region);
                     host_read_barrier(
                         d,

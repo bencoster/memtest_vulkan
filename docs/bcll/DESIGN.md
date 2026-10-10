@@ -48,8 +48,10 @@ and USAGE.md for commands. The report format is in SCHEMA.md and `report.schema.
 | `cli.rs` | long-flag CLI |
 | `inventory.rs` | GPUs + numbering |
 | `select.rs` | `--gpu` specs |
-| `orchestrate.rs` | run flow, safety gate, telemetry wiring, output |
-| `runners.rs` | spawn workers with deadlines |
+| `orchestrate.rs` | run flow (no driver calls), safety gate, output persistence |
+| `runners.rs` | spawn test workers with identity + deadlines |
+| `proc.rs` | bounded child supervision, containment, self-deadline |
+| `query.rs` | inventory / snapshot / telemetry worker processes + bounded clients |
 | `judge.rs` | pure exit-code/event → result rules |
 | `report.rs` | schema types + verdict |
 | `events.rs` | JSONL |
@@ -69,27 +71,45 @@ and USAGE.md for commands. The report format is in SCHEMA.md and `report.schema.
 ## 3. Process model
 
 ```
-memtest_vulkan --gpu 0000:01:00.0 --memtest 300 --compute 60 --report-json r.json
- └─ orchestrator (parent; never touches the GPU with work)
-     ├─ inventory: Vulkan enumeration (upstream fn) + NVML (by PCI id) + NVAPI (Windows, by bus)
-     ├─ safety gate: display-attached? VRAM in use? → refuse unless overridden
-     ├─ health snapshot BEFORE (ECC volatile/aggregate DRAM/SRAM, remapper, retired pages)
-     ├─ telemetry thread (NVML + NVAPI + Linux sysfs AER), prints a line every N s
-     ├─ for each selected test: spawn a WORKER child, wait with a watchdog deadline
-     │    memtest      : exe <-1-vkidx> <bytes>   (upstream child protocol, unchanged)
-     │                   + env MEMTEST_VULKAN_EVENTS / MEMTEST_VULKAN_STOP_AFTER_S
-     │    compute      : exe --bcll-worker compute  --vk-index i --seconds s --events f
-     │    transfer     : exe --bcll-worker transfer --vk-index i --seconds s --events f
-     │    cuda-memtest : exe --bcll-worker cuda-memtest --uuid U --pci P --seconds s --events f
-     │    codec        : ffmpeg children (no worker needed)
-     ├─ health snapshot AFTER, deltas, verdict
-     └─ JSON report + exit code
+memtest_vulkan --gpu 0000:c1:00.0 --memtest 300 --compute 60 --report-json r.json
+ └─ supervisor (makes NO GPU-driver call itself; every child via proc.rs)
+     ├─ query worker: inventory (Vulkan enumeration + NVML join by PCI id)     [60 s bound]
+     ├─ query worker: snapshot BEFORE (display, usage, details, ECC/remap, AER) [60 s bound]
+     ├─ safety gate on that evidence; unknown = refuse unless overridden
+     ├─ telemetry worker (NVML + NVAPI + Linux AER) -> samples JSONL, stopped by bounded kill
+     ├─ for each selected test: a GPU worker child, given the approved IDENTITY
+     │    memtest      : exe <-1-vkidx> <bytes>   (upstream child protocol)
+     │                   + env MEMTEST_VULKAN_{EVENTS,STOP_AFTER_S,EXPECT_PCI,EXPECT_UUID,HARD_DEADLINE_S}
+     │    compute      : exe --bcll-worker compute  --pci P --uuid VKUUID --seconds s --hard-deadline-s h --events f
+     │    transfer     : exe --bcll-worker transfer --pci P --uuid VKUUID ...
+     │    cuda-memtest : exe --bcll-worker cuda-memtest --pci P --uuid NVMLUUID ... (+ CUDA_VISIBLE_DEVICES=UUID)
+     │    codec        : ffmpeg children (discovery + encode + decode, all bounded)
+     ├─ query worker: snapshot AFTER, deltas, verdict
+     └─ JSON output (also for refusals/errors) + exit code
 ```
 
-Why child processes: a GPU fault (Xid, TDR, `DEVICE_LOST`, CUDA sticky error) kills only the worker. The
-orchestrator still collects telemetry, takes the AFTER snapshot (which is exactly when ECC/remap deltas
-appear) and writes the report. A watchdog kills a worker that overruns `seconds + grace`, so the fork
-does not inherit upstream's infinite fence wait (R5).
+Why child processes: a GPU fault (Xid, TDR, `DEVICE_LOST`, CUDA sticky error) or a wedged driver call
+kills only a worker. The supervisor still collects telemetry, takes the AFTER snapshot (which is exactly
+when ECC/remap deltas appear) and writes the output.
+
+**Bounded supervision (`proc.rs`, Codex BLOCK 89de0c26 #1).**
+- Every wait has a deadline. A child that overruns is killed, and its death is awaited for a bounded
+  grace period. `dead_confirmed` records whether it actually died; it is never assumed. An unconfirmed
+  death is reported (metric `worker_dead_confirmed`, a warning).
+- Pipes are drained on detached threads and collected with a bound, so a grandchild holding an inherited
+  handle cannot hold the supervisor.
+- Containment:
+  - Windows: every child joins a kill-on-close Job Object.
+  - Linux: children get `PR_SET_PDEATHSIG=SIGKILL`.
+  - Every worker, including the upstream memtest child via `MEMTEST_VULKAN_HARD_DEADLINE_S`, also arms
+    its own hard deadline, so it ends even if the supervisor is dead or stuck.
+
+**Identity handoff (BLOCK #2).** Workers never receive an ordinal as their identity. Each one
+re-enumerates and selects the device whose full PCI id **and** Vulkan deviceUUID match. The CUDA worker
+matches cuDeviceGetUuid plus the PCI attributes. A missing, ambiguous or mismatching identity is refused
+before any device is created. The upstream memtest child still uses its positional ordinal, but
+`hooks::identity_ok` refuses the selected device unless it matches `EXPECT_PCI` / `EXPECT_UUID`.
+Verified read-only on the rig: the Vulkan deviceUUID equals the NVML UUID on all four cards.
 
 Workers report through a **JSON-lines events file**: one object per line, written and flushed per
 event. A crash leaves a truncated, still-parseable file. The memtest child's events are written by
@@ -101,7 +121,7 @@ event. A crash leaves a truncated, still-parseable file. The memtest child's eve
 
 | Form | Meaning |
 |---|---|
-| `0`, `index:0` | Nth GPU in **PCI bus order**. That equals the nvidia-smi index and CUDA with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, the BC_LocalLLM numbering. It is deliberately NOT upstream's label number (REVIEW R7). |
+| `0`, `index:0` | the **nvidia-smi index**, read from NVML and joined to Vulkan by full PCI id (BLOCK #7). Without NVML a bare index is refused, never guessed; select by PCI or UUID. It is NOT upstream's label number (REVIEW R7). |
 | `0000:81:00.0`, `81:00.0`, `pci:81:00.0` | PCI address, case-insensitive; domain defaults to 0 |
 | `GPU-6727…`, `uuid:GPU-6727…` | NVML/CUDA UUID; a unique prefix is accepted |
 | `vk:N` | upstream label number (for parity with upstream output) |
@@ -110,12 +130,20 @@ Identity sources:
 - **PCI**: `VK_EXT_pci_bus_info`, cross-checked with NVML `pci_info`.
 - **UUID**: Vulkan `deviceUUID` (equal to the CUDA/NVML UUID on NVIDIA), otherwise NVML.
 
-Refusals (exit code 3):
-- **Display-attached** (NVML `is_display_active || is_display_connected`): refused unless
-  `--allow-display`. If the display state is **unknown** (no NVML, non-NVIDIA), the tool fails closed
-  and still requires `--allow-display`.
-- **VRAM in use** above `--max-used-mb` (default 1024), or compute processes listed by NVML: refused
-  unless `--allow-busy`. This catches "the LLM is still loaded on that card".
+Refusals (exit code 3). Evidence is tri-state, and anything unknown refuses (BLOCK #3).
+
+| Condition | Refused unless |
+|---|---|
+| **Display attached.** Attached if *either* NVML display query says so; detached only if *both* answered "no"; a failed query = unknown. | `--allow-display` |
+| **VRAM in use** above `--max-used-mb` (default 1024) | `--allow-busy` |
+| **Compute processes listed** by NVML | `--allow-busy` |
+| **Usage unknown, or process list unavailable.** A failed process query is *not* "no processes". Verified: NVML lists compute processes under WDDM on this rig. | `--allow-busy` |
+
+Also refused:
+- a selected card without a usable PCI id
+- a card whose Vulkan and NVML UUIDs disagree
+
+A refusal still writes the output (`refusal` set, verdict null) when `--report-json` is given.
 
 ## 5. Card details (feature `nvml`, crate `nvml-wrapper` 0.13, NVML dynamically loaded)
 
@@ -325,8 +353,16 @@ Exit codes:
 | 0 | PASS |
 | 1 | FAIL |
 | 2 | INCOMPLETE |
-| 3 | refused / usage error |
-| 4 | internal error |
+| 3 | refused / usage error (output written with `refusal`) |
+| 4 | operational error, **including a requested output file that could not be written** (the verdict is still printed) |
+
+PASS requires at least one test that ran to completion (BLOCK #6). All-unsupported or all-skipped
+runs are INCOMPLETE ("no test completed"). Recorded mismatches always make a test FAIL, even if the
+run later timed out, lost the device or crashed (BLOCK #5). `termination` keeps how it ended.
+
+Output persistence (BLOCK #8): an existing output file is deleted before the run starts. If it cannot
+be deleted, the run is refused (exit 4), so a stale file is never read as this run's result. Writes go
+to a unique temp name, which is renamed into place, or removed on failure.
 
 ## 9. Proposed upstream patches
 

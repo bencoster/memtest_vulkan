@@ -1,19 +1,10 @@
 //! Stand-in for `nvml.rs` when the crate is built without the `nvml` feature.
 //! Same API; `open()` always fails so callers take their "no NVML" paths.
 
-use super::telemetry::{HealthSnapshot, Sample};
+use super::telemetry::{HealthSnapshot, Sample, Usage};
 use serde_json::Value;
 
 pub struct NvmlCtx;
-
-#[derive(Debug, Clone, Default)]
-pub struct Usage {
-    pub total_bytes: u64,
-    pub used_bytes: u64,
-    pub free_bytes: u64,
-    pub reserved_bytes: Option<u64>,
-    pub compute_pids: Vec<u32>,
-}
 
 impl NvmlCtx {
     pub fn open() -> Result<Self, String> {
@@ -29,6 +20,9 @@ impl NvmlCtx {
         None
     }
     pub fn display_attached(&self, _pci: &str) -> Option<bool> {
+        None
+    }
+    pub fn index(&self, _pci: &str) -> Option<u32> {
         None
     }
     pub fn usage(&self, _pci: &str) -> Option<Usage> {

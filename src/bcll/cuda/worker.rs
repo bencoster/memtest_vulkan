@@ -203,6 +203,7 @@ fn find_device(api: &Api, uuid: Option<&str>, pci: Option<&str>) -> Result<CUdev
 }
 
 pub fn run_worker(args: &WorkerArgs) -> i32 {
+    crate::bcll::proc::arm_self_deadline(args.hard_deadline_s, EXIT_INCOMPLETE, &args.events);
     let mut ev = EventWriter::create(&args.events);
     let api = match Api::load() {
         Ok(a) => a,
@@ -473,6 +474,13 @@ fn run(api: &Api, args: &WorkerArgs, ev: &mut EventWriter) -> Result<u64, CudaEr
                         )?;
                         if host.count > 0 {
                             pass_errors += host.count;
+                            // exact count per op, so an unfinished pass still counts (BLOCK #5)
+                            ev.emit(
+                                "cuda_op_errors",
+                                json!({
+                                    "round": round, "pass": pass.name, "errors": host.count,
+                                }),
+                            );
                             for (b, n) in host.bit_hist.iter().enumerate() {
                                 bit_hist[b] += *n as u64;
                             }

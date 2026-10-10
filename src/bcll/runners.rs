@@ -1,15 +1,17 @@
-//! Test runners: spawn one worker child per test, enforce its deadline, and
-//! convert its events into a `TestResult` via `judge` (DESIGN.md sections 3, 7).
+//! Test runners: spawn one worker child per test under `proc` (bounded wait, bounded
+//! kill, contained), hand it the approved IDENTITY (never an ordinal), and convert its
+//! events into a `TestResult` via `judge` (DESIGN.md sections 3, 7).
 
 use super::cli::Options;
 use super::events::{self, of_kind};
 use super::inventory::GpuRecord;
 use super::judge::{self, InitOutcome};
-use super::nvml::NvmlCtx;
+use super::proc::{self, Limits, Outcome};
 use super::report::{Coverage, ErrorRecord, TestResult, TestStatus};
+use super::telemetry::Usage;
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Extra wall time a memtest child gets for allocation + initial fill.
@@ -21,33 +23,19 @@ pub(super) struct Ctx<'a> {
     pub(super) opts: &'a Options,
     pub(super) gpu: GpuRecord,
     pub(super) exe: PathBuf,
+    /// unique per run (even under a caller-supplied --work-dir)
     pub(super) work: PathBuf,
-    pub(super) nvml: Option<NvmlCtx>,
+    /// occupancy sampled BEFORE any test started (coverage "free at start")
+    pub(super) usage_before: Option<Usage>,
 }
 
-enum WaitOutcome {
-    Exited(Option<i32>),
-    TimedOut,
-    SpawnFailed(String),
-}
-
-fn spawn_wait(mut cmd: std::process::Command, timeout: Duration) -> WaitOutcome {
-    let mut child = match cmd.stdin(Stdio::null()).spawn() {
-        Ok(c) => c,
-        Err(e) => return WaitOutcome::SpawnFailed(e.to_string()),
-    };
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return WaitOutcome::Exited(status.code()),
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return WaitOutcome::TimedOut;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-            Err(e) => return WaitOutcome::SpawnFailed(e.to_string()),
-        }
+impl Ctx<'_> {
+    /// Worker self-termination: a little before the supervisor's own deadline.
+    fn hard_deadline(&self, budget_s: f64) -> f64 {
+        budget_s + self.opts.worker_grace_s * 0.75
+    }
+    fn supervisor_timeout(&self, budget_s: f64) -> Duration {
+        Duration::from_secs_f64(budget_s + self.opts.worker_grace_s)
     }
 }
 
@@ -57,20 +45,32 @@ fn events_path(ctx: &Ctx, name: &str) -> PathBuf {
     p
 }
 
-fn coverage_from_nvml(ctx: &Ctx, tested: u64) -> Coverage {
-    let usage = ctx.nvml.as_ref().and_then(|n| n.usage(&ctx.gpu.pci_bus_id));
+fn coverage(ctx: &Ctx, tested: u64) -> Coverage {
+    let u = ctx.usage_before.as_ref();
     Coverage {
         tested_bytes: tested,
-        total_bytes: usage
-            .as_ref()
+        total_bytes: u
             .map(|u| u.total_bytes)
             .or(Some(ctx.gpu.device_local_bytes)),
-        free_bytes_at_start: usage.as_ref().map(|u| u.free_bytes),
-        reserved_or_used_bytes: usage
-            .as_ref()
-            .map(|u| u.total_bytes.saturating_sub(u.free_bytes)),
-        driver_reserved_bytes: usage.as_ref().and_then(|u| u.reserved_bytes),
+        free_bytes_at_start: u.map(|u| u.free_bytes),
+        reserved_or_used_bytes: u.map(|u| u.total_bytes.saturating_sub(u.free_bytes)),
+        driver_reserved_bytes: u.and_then(|u| u.reserved_bytes),
     }
+}
+
+/// Records whether the worker's death was confirmed (BLOCK 89de0c26 #1: never assumed).
+fn record_death(t: &mut TestResult, o: &Outcome) {
+    t.set_metric("worker_dead_confirmed", o.dead_confirmed);
+    if let Some(note) = o.death_note() {
+        t.message = Some(match t.message.take() {
+            Some(m) => format!("{m}; {note}"),
+            None => note,
+        });
+    }
+}
+
+fn run_child(cmd: Command, timeout: Duration) -> Result<Outcome, String> {
+    proc::run(cmd, &Limits::new(timeout), false, false)
 }
 
 pub(super) fn run_memtest(ctx: &Ctx, seconds: f64) -> TestResult {
@@ -85,6 +85,7 @@ pub(super) fn run_memtest(ctx: &Ctx, seconds: f64) -> TestResult {
         "[vram/vulkan] {seconds:.0}s, up to {:.2} GiB (upstream memtest algorithm)",
         bytes as f64 / (1u64 << 30) as f64
     );
+    let budget = seconds + MEMTEST_INIT_ALLOWANCE_S;
     let mut attempts: Vec<Value> = Vec::new();
     loop {
         if bytes < MIN_TEST_BYTES {
@@ -94,20 +95,25 @@ pub(super) fn run_memtest(ctx: &Ctx, seconds: f64) -> TestResult {
             break;
         }
         let ev_path = events_path(ctx, "memtest");
-        let mut cmd = std::process::Command::new(&ctx.exe);
-        // per-run working dir: upstream's memtest_vulkan.log rotation is not safe for
-        // concurrent writers (Codex audit F8), so each run gets its own log file
+        let mut cmd = Command::new(&ctx.exe);
+        // upstream positional protocol selects by enumeration ordinal; the identity hook
+        // makes the child refuse anything but the approved card (BLOCK 89de0c26 #2)
         cmd.arg((-1 - ctx.gpu.vk_enum_index as isize).to_string())
             .arg(bytes.to_string())
             .current_dir(&ctx.work)
             .env(crate::hooks::ENV_EVENTS, &ev_path)
-            .env(crate::hooks::ENV_STOP_AFTER_S, format!("{seconds}"));
-        let timeout =
-            Duration::from_secs_f64(seconds + MEMTEST_INIT_ALLOWANCE_S + ctx.opts.worker_grace_s);
-        let (code, timed_out) = match spawn_wait(cmd, timeout) {
-            WaitOutcome::Exited(c) => (c, false),
-            WaitOutcome::TimedOut => (None, true),
-            WaitOutcome::SpawnFailed(e) => {
+            .env(crate::hooks::ENV_STOP_AFTER_S, format!("{seconds}"))
+            .env(crate::hooks::ENV_EXPECT_PCI, &ctx.gpu.pci_bus_id)
+            .env(
+                crate::hooks::ENV_HARD_DEADLINE_S,
+                format!("{}", ctx.hard_deadline(budget)),
+            );
+        if let Some(u) = &ctx.gpu.vk_uuid {
+            cmd.env(crate::hooks::ENV_EXPECT_UUID, u);
+        }
+        let o = match run_child(cmd, ctx.supervisor_timeout(budget)) {
+            Ok(o) => o,
+            Err(e) => {
                 t.status = TestStatus::Error;
                 t.message = Some(format!("cannot start memtest child: {e}"));
                 break;
@@ -115,7 +121,7 @@ pub(super) fn run_memtest(ctx: &Ctx, seconds: f64) -> TestResult {
         };
         let ev = events::read_events(&ev_path);
         let started = of_kind(&ev, "memtest_started").last().cloned();
-        match judge::init_outcome(code, &ev, attempts.len()) {
+        match judge::init_outcome(o.exit_code, &ev, attempts.len()) {
             InitOutcome::Proceed => {}
             InitOutcome::RetryLower(msg) => {
                 attempts.push(json!({"bytes": bytes, "error": msg}));
@@ -130,7 +136,9 @@ pub(super) fn run_memtest(ctx: &Ctx, seconds: f64) -> TestResult {
                 attempts.push(json!({"bytes": bytes, "error": msg}));
                 t.status = TestStatus::Incomplete;
                 t.termination = Some(
-                    if msg.contains("DEVICE_LOST") {
+                    if msg.contains("identity mismatch") {
+                        "identity_mismatch"
+                    } else if msg.contains("DEVICE_LOST") {
                         "device_lost"
                     } else {
                         "init_failed"
@@ -139,16 +147,18 @@ pub(super) fn run_memtest(ctx: &Ctx, seconds: f64) -> TestResult {
                 );
                 t.message = Some(format!("memtest init failed, not retried: {msg}"));
                 t.set_metric("allocation_attempts", &attempts);
+                record_death(&mut t, &o);
                 break;
             }
         }
         t.set_metric("allocation_attempts", &attempts);
-        t = judge::judge_memtest(t, code, timed_out, &ev);
+        t = judge::judge_memtest(t, o.exit_code, o.timed_out, &ev);
+        record_death(&mut t, &o);
         let tested = started
             .as_ref()
             .and_then(|s| s["tested_bytes"].as_u64())
             .unwrap_or(0);
-        t.coverage = Some(coverage_from_nvml(ctx, tested));
+        t.coverage = Some(coverage(ctx, tested));
         if let Some(s) = started {
             t.set_metric("allocation_bytes", s["allocation_bytes"].clone());
             t.set_metric("window_bytes", s["window_bytes"].clone());
@@ -175,6 +185,27 @@ fn keep_memtest_log(ctx: &Ctx) {
     }
 }
 
+fn worker_cmd(
+    ctx: &Ctx,
+    kind: &str,
+    uuid: Option<&str>,
+    seconds: f64,
+    ev_path: &PathBuf,
+) -> Command {
+    let mut cmd = Command::new(&ctx.exe);
+    cmd.args(["--bcll-worker", kind, "--pci", &ctx.gpu.pci_bus_id])
+        .arg("--seconds")
+        .arg(format!("{seconds}"))
+        .arg("--hard-deadline-s")
+        .arg(format!("{}", ctx.hard_deadline(seconds)))
+        .arg("--events")
+        .arg(ev_path);
+    if let Some(u) = uuid {
+        cmd.args(["--uuid", u]);
+    }
+    cmd
+}
+
 pub(super) fn run_vk_worker(ctx: &Ctx, kind: &str, seconds: f64) -> TestResult {
     let (test_kind, name) = match kind {
         "compute" => ("compute", "vulkan_compute"),
@@ -185,28 +216,17 @@ pub(super) fn run_vk_worker(ctx: &Ctx, kind: &str, seconds: f64) -> TestResult {
     t.started_at = Some(crate::output::NowTime.to_string());
     let start = Instant::now();
     let ev_path = events_path(ctx, kind);
-    let mut cmd = std::process::Command::new(&ctx.exe);
-    cmd.args(["--bcll-worker", kind, "--vk-index"])
-        .arg(ctx.gpu.vk_enum_index.to_string())
-        .arg("--seconds")
-        .arg(format!("{seconds}"))
-        .arg("--events")
-        .arg(&ev_path);
-    let outcome = spawn_wait(
-        cmd,
-        Duration::from_secs_f64(seconds + ctx.opts.worker_grace_s),
-    );
-    let ev = events::read_events(&ev_path);
-    let (code, timed_out) = match outcome {
-        WaitOutcome::Exited(c) => (c, false),
-        WaitOutcome::TimedOut => (None, true),
-        WaitOutcome::SpawnFailed(e) => {
+    let cmd = worker_cmd(ctx, kind, ctx.gpu.vk_uuid.as_deref(), seconds, &ev_path);
+    let o = match run_child(cmd, ctx.supervisor_timeout(seconds)) {
+        Ok(o) => o,
+        Err(e) => {
             t.status = TestStatus::Error;
             t.message = Some(format!("cannot start worker: {e}"));
             return t;
         }
     };
-    (t.status, t.message) = judge::worker_status(code, timed_out, &ev);
+    let ev = events::read_events(&ev_path);
+    (t.status, t.message) = judge::worker_status(o.exit_code, o.timed_out, &ev);
     if kind == "compute" {
         let batches: Vec<&Value> = of_kind(&ev, "compute_batch").collect();
         t.set_metric("batches", batches.len());
@@ -269,10 +289,9 @@ pub(super) fn run_vk_worker(ctx: &Ctx, kind: &str, seconds: f64) -> TestResult {
             });
         }
     }
-    if t.error_count > 0 && t.status == TestStatus::Pass {
-        t.status = TestStatus::Fail; // never trust an exit code over recorded errors
-    }
-    t.termination = Some(judge::worker_termination(t.status, code, timed_out, &ev).into());
+    t.termination = Some(judge::worker_termination(o.exit_code, o.timed_out, &ev).into());
+    judge::latch_mismatches(&mut t);
+    record_death(&mut t, &o);
     t.duration_s = Some(start.elapsed().as_secs_f64());
     t
 }
@@ -290,46 +309,30 @@ pub(super) fn run_cuda(ctx: &Ctx, seconds: f64) -> TestResult {
         t.message = Some("built without the 'cuda' feature".into());
         return t;
     }
-    let Some(uuid) = ctx.gpu.uuid.clone() else {
+    let Some(uuid) = ctx.gpu.uuid() else {
         t.status = TestStatus::Error;
         t.message = Some("GPU UUID unknown - cannot pin the CUDA worker to the card".into());
         return t;
     };
     let ev_path = events_path(ctx, "cuda");
-    let mut cmd = std::process::Command::new(&ctx.exe);
-    cmd.args([
-        "--bcll-worker",
-        "cuda-memtest",
-        "--uuid",
-        &uuid,
-        "--pci",
-        &ctx.gpu.pci_bus_id,
-    ])
-    .arg("--seconds")
-    .arg(format!("{seconds}"))
-    .arg("--events")
-    .arg(&ev_path)
-    .arg("--cuda-keep-free-mb")
-    .arg(ctx.opts.cuda_keep_free_mb.to_string())
-    .env("CUDA_VISIBLE_DEVICES", &uuid)
-    .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
-    let outcome = spawn_wait(
-        cmd,
-        Duration::from_secs_f64(seconds + ctx.opts.worker_grace_s),
-    );
-    let ev = events::read_events(&ev_path);
-    let (code, timed_out) = match outcome {
-        WaitOutcome::Exited(c) => (c, false),
-        WaitOutcome::TimedOut => (None, true),
-        WaitOutcome::SpawnFailed(e) => {
+    let mut cmd = worker_cmd(ctx, "cuda-memtest", Some(&uuid), seconds, &ev_path);
+    cmd.arg("--cuda-keep-free-mb")
+        .arg(ctx.opts.cuda_keep_free_mb.to_string())
+        .env("CUDA_VISIBLE_DEVICES", &uuid)
+        .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
+    let o = match run_child(cmd, ctx.supervisor_timeout(seconds)) {
+        Ok(o) => o,
+        Err(e) => {
             t.status = TestStatus::Error;
             t.message = Some(format!("cannot start worker: {e}"));
             return t;
         }
     };
-    t = judge::judge_cuda(t, code, timed_out, &ev);
+    let ev = events::read_events(&ev_path);
+    t = judge::judge_cuda(t, o.exit_code, o.timed_out, &ev);
+    record_death(&mut t, &o);
     if let Some(c) = t.coverage.as_mut() {
-        c.driver_reserved_bytes = coverage_from_nvml(ctx, 0).driver_reserved_bytes;
+        c.driver_reserved_bytes = ctx.usage_before.as_ref().and_then(|u| u.reserved_bytes);
     }
     t.duration_s = Some(start.elapsed().as_secs_f64());
     t

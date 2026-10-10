@@ -96,11 +96,13 @@ mod imp {
     type Initialize = unsafe extern "C" fn() -> i32;
     type EnumPhysicalGpus = unsafe extern "C" fn(*mut [*mut c_void; 64], *mut u32) -> i32;
     type GetBusId = unsafe extern "C" fn(*mut c_void, *mut u32) -> i32;
+    type GetBusSlotId = unsafe extern "C" fn(*mut c_void, *mut u32) -> i32;
     type ThermalGetSensors = unsafe extern "C" fn(*mut c_void, *mut ThermalSensors) -> i32;
 
     const ID_INITIALIZE: u32 = 0x0150_E828;
     const ID_ENUM_PHYSICAL_GPUS: u32 = 0xE5AC_921F;
     const ID_GPU_GET_BUS_ID: u32 = 0x1BE0_B8E5;
+    const ID_GPU_GET_BUS_SLOT_ID: u32 = 0x2A0A_350F;
     const ID_GPU_THERMAL_GET_SENSORS: u32 = 0x65FE_3AAD;
 
     #[repr(C)]
@@ -135,10 +137,15 @@ mod imp {
     }
 
     impl Reader {
-        pub fn open(pci_bus: u32, arch: Option<&str>, name: &str) -> Result<Reader, String> {
+        pub fn open(
+            pci_bus: u32,
+            pci_device: u32,
+            arch: Option<&str>,
+            name: &str,
+        ) -> Result<Reader, String> {
             // SAFETY: loading the NVIDIA-shipped system DLL; all symbols are checked for null.
             unsafe {
-                let lib = libloading::Library::new("nvapi64.dll")
+                let lib = libloading::Library::new(crate::bcll::system_library("nvapi64.dll"))
                     .map_err(|e| format!("nvapi64.dll not loadable: {e}"))?;
                 let qi: QueryInterface = *lib
                     .get::<QueryInterface>(b"nvapi_QueryInterface\0")
@@ -163,14 +170,41 @@ mod imp {
                 if enum_gpus(&mut handles, &mut count) != 0 {
                     return Err("NvAPI_EnumPhysicalGPUs failed".into());
                 }
-                let gpu = handles[..(count as usize).min(64)]
+                let on_bus: Vec<*mut c_void> = handles[..(count as usize).min(64)]
                     .iter()
                     .copied()
-                    .find(|h| {
+                    .filter(|h| {
                         let mut b = u32::MAX;
                         bus_id(*h, &mut b) == 0 && b == pci_bus
                     })
-                    .ok_or_else(|| format!("no NVAPI GPU on PCI bus 0x{pci_bus:02X}"))?;
+                    .collect();
+                // NVAPI has no PCI domain: require an unambiguous match (BLOCK 89de0c26 note)
+                let gpu = match on_bus.as_slice() {
+                    [one] => *one,
+                    [] => return Err(format!("no NVAPI GPU on PCI bus 0x{pci_bus:02X}")),
+                    many => {
+                        let slot_fn: Option<GetBusSlotId> = sym(ID_GPU_GET_BUS_SLOT_ID)
+                            .ok()
+                            .map(|p| std::mem::transmute::<*mut c_void, GetBusSlotId>(p));
+                        let by_slot: Vec<*mut c_void> = many
+                            .iter()
+                            .copied()
+                            .filter(|h| {
+                                let mut sl = u32::MAX;
+                                slot_fn.is_some_and(|f| f(*h, &mut sl) == 0 && sl == pci_device)
+                            })
+                            .collect();
+                        match by_slot.as_slice() {
+                            [one] => *one,
+                            _ => {
+                                return Err(format!(
+                                    "{} NVAPI GPUs on PCI bus 0x{pci_bus:02X}: ambiguous, junction temperature disabled",
+                                    many.len()
+                                ));
+                            }
+                        }
+                    }
+                };
                 let mask = mask_from_probe(|m| {
                     let mut s = ThermalSensors::new(m);
                     get(gpu, &mut s) == 0
@@ -214,7 +248,12 @@ mod imp {
     use super::*;
     pub struct Reader;
     impl Reader {
-        pub fn open(_pci_bus: u32, _arch: Option<&str>, _name: &str) -> Result<Reader, String> {
+        pub fn open(
+            _pci_bus: u32,
+            _pci_device: u32,
+            _arch: Option<&str>,
+            _name: &str,
+        ) -> Result<Reader, String> {
             Err("NVAPI thermal reader is Windows-only (feature 'nvapi')".into())
         }
         pub fn read(&mut self) -> Option<NvapiTemps> {

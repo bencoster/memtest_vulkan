@@ -24,17 +24,29 @@ pub enum WorkerKind {
     Compute,
     Transfer,
     CudaMemtest,
+    /// driver queries (Vulkan inventory, NVML/NVAPI snapshot), isolated from the supervisor
+    Query,
+    /// NVML/NVAPI/AER sampler writing samples to the events file until killed
+    Telemetry,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerArgs {
     pub kind: WorkerKind,
-    pub vk_index: Option<usize>,
+    /// approved identity: every GPU worker re-resolves its device by these
     pub uuid: Option<String>,
     pub pci: Option<String>,
     pub seconds: f64,
     pub events: PathBuf,
     pub keep_free_mb: u64,
+    /// worker self-termination limit (survives a dead or stuck supervisor)
+    pub hard_deadline_s: Option<f64>,
+    /// `inventory` | `snapshot` for the query worker
+    pub query: Option<String>,
+    pub name: Option<String>,
+    pub no_nvapi: bool,
+    pub interval_ms: u64,
+    pub print_s: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,8 +125,8 @@ USAGE
   memtest_vulkan --gpu SPEC [TESTS] [OPTIONS]
 
 GPU SELECTION (--gpu SPEC)
-  0 | index:0                 Nth GPU in PCI bus order (= nvidia-smi index,
-                              CUDA_DEVICE_ORDER=PCI_BUS_ID). NOT upstream's label.
+  0 | index:0                 nvidia-smi index (NVML, joined by PCI id; refused
+                              without NVML). NOT upstream's label.
   0000:81:00.0 | 81:00.0      PCI address (pci: prefix optional)
   GPU-6727... | uuid:GPU-...  NVML/CUDA UUID (unique prefix accepted)
   vk:N                        upstream memtest_vulkan label number
@@ -144,7 +156,8 @@ OUTPUT / TELEMETRY
   --work-dir DIR              where worker event files go (default: temp dir)
   --worker-grace-s S          extra time before a worker is declared hung (default 120)
 
-EXIT CODES  0 PASS, 1 FAIL, 2 INCOMPLETE, 3 refused/usage, 4 internal error
+EXIT CODES  0 PASS, 1 FAIL, 2 INCOMPLETE, 3 refused/usage, 4 operational error
+            (incl. --report-json not writable)
 Docs: docs/bcll/USAGE.md
 ";
 
@@ -193,7 +206,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut o = Options::default();
     let mut explicit_command: Option<Command> = None;
     let mut worker_kind: Option<WorkerKind> = None;
-    let mut w_vk_index = None;
+    let mut w_hard = None;
+    let mut w_query = None;
+    let mut w_name = None;
     let mut w_uuid = None;
     let mut w_pci = None;
     let mut w_seconds = None;
@@ -259,10 +274,14 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                     "compute" => WorkerKind::Compute,
                     "transfer" => WorkerKind::Transfer,
                     "cuda-memtest" => WorkerKind::CudaMemtest,
+                    "query" => WorkerKind::Query,
+                    "telemetry" => WorkerKind::Telemetry,
                     other => return Err(format!("unknown worker '{other}'")),
                 })
             }
-            "--vk-index" => w_vk_index = Some(parse_u64(&flag, &take(&flag)?)? as usize),
+            "--hard-deadline-s" => w_hard = Some(parse_f64(&flag, &take(&flag)?)?),
+            "--query" => w_query = Some(take(&flag)?),
+            "--name" => w_name = Some(take(&flag)?),
             "--uuid" => w_uuid = Some(take(&flag)?),
             "--pci" => w_pci = Some(take(&flag)?),
             "--seconds" => w_seconds = Some(parse_f64(&flag, &take(&flag)?)?),
@@ -273,14 +292,43 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     }
 
     if let Some(kind) = worker_kind {
+        let gpu_worker = matches!(
+            kind,
+            WorkerKind::Compute | WorkerKind::Transfer | WorkerKind::CudaMemtest
+        );
+        if kind == WorkerKind::Query {
+            match w_query.as_deref() {
+                Some("inventory") => {}
+                Some("snapshot") if w_pci.is_some() => {}
+                Some("snapshot") => return Err("--query snapshot requires --pci".into()),
+                _ => return Err("query worker requires --query inventory|snapshot".into()),
+            }
+        }
+        if (gpu_worker || kind == WorkerKind::Telemetry) && w_pci.is_none() {
+            return Err("GPU workers require --pci (identity, never an ordinal)".into());
+        }
+        let needs_run = kind != WorkerKind::Query;
         o.command = Command::Worker(WorkerArgs {
             kind,
-            vk_index: w_vk_index,
             uuid: w_uuid,
             pci: w_pci,
-            seconds: w_seconds.ok_or("--bcll-worker requires --seconds")?,
-            events: w_events.ok_or("--bcll-worker requires --events")?,
+            seconds: if needs_run {
+                w_seconds.ok_or("--bcll-worker requires --seconds")?
+            } else {
+                w_seconds.unwrap_or(60.0)
+            },
+            events: if needs_run {
+                w_events.ok_or("--bcll-worker requires --events")?
+            } else {
+                w_events.unwrap_or_default()
+            },
             keep_free_mb: o.cuda_keep_free_mb,
+            hard_deadline_s: w_hard,
+            query: w_query,
+            name: w_name,
+            no_nvapi: o.no_nvapi,
+            interval_ms: o.telemetry_ms,
+            print_s: o.telemetry_print_s,
         });
         return Ok(o);
     }
@@ -386,5 +434,43 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(parse(&args("--bcll-worker compute --seconds 5")).is_err());
+        // ordinals are not an identity: GPU workers need --pci
+        assert!(
+            parse(&args("--bcll-worker compute --seconds 5 --events e"))
+                .unwrap_err()
+                .contains("--pci")
+        );
+        let o = parse(&args(
+            "--bcll-worker compute --pci 0000:c1:00.0 --uuid GPU-x --seconds 5 --events e --hard-deadline-s 90",
+        ))
+        .unwrap();
+        match o.command {
+            Command::Worker(w) => assert_eq!(w.hard_deadline_s, Some(90.0)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_and_telemetry_worker_protocol() {
+        assert!(parse(&args("--bcll-worker query --query inventory")).is_ok());
+        assert!(parse(&args("--bcll-worker query --query snapshot")).is_err());
+        assert!(
+            parse(&args(
+                "--bcll-worker query --query snapshot --pci 81:00.0 --no-nvapi"
+            ))
+            .is_ok()
+        );
+        assert!(parse(&args("--bcll-worker query --query bogus")).is_err());
+        let o = parse(&args(
+            "--bcll-worker telemetry --pci 0000:c1:00.0 --seconds 600 --events t.jsonl --telemetry-ms 500",
+        ))
+        .unwrap();
+        match o.command {
+            Command::Worker(w) => {
+                assert_eq!(w.kind, WorkerKind::Telemetry);
+                assert_eq!(w.interval_ms, 500);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -28,6 +28,12 @@ pub enum InitOutcome {
 /// Codex audit F3: never treat DEVICE_LOST (or an unknown init failure) as memory pressure.
 pub fn init_outcome(code: Option<i32>, ev: &[Value], retries_done: usize) -> InitOutcome {
     use crate::close::app_status as st;
+    if let Some(m) = of_kind(ev, "memtest_identity_mismatch").last() {
+        return InitOutcome::Stop(format!(
+            "identity mismatch, no device created: {}",
+            m["message"].as_str().unwrap_or("?")
+        ));
+    }
     let init_abort = code.map(|c| c as u32 as u8) == Some(st::SIGNATURE | st::RUNTIME_ABORT);
     if !init_abort || of_kind(ev, "memtest_started").next().is_some() {
         return InitOutcome::Proceed;
@@ -118,6 +124,7 @@ pub fn judge_memtest(
     let code = outcome_code.map(|c| c as u32 as u8);
     let has_sig = code.is_some_and(|c| c & st::SIGNATURE_MASK == st::SIGNATURE);
     let bits = |b: u8| code.is_some_and(|c| has_sig && c & b != 0);
+    let timed_out = timed_out || of_kind(ev, "memtest_hard_deadline").next().is_some();
     t.status = if bits(st::RUNTIME_ERRORS) || t.error_count > 0 {
         TestStatus::Fail
     } else if timed_out {
@@ -140,43 +147,68 @@ pub fn judge_memtest(
         t.message = Some(format!("memtest stopped early ({finished:?})"));
         TestStatus::Incomplete
     };
+    // how the run ENDED, independent of whether mismatches were seen (BLOCK 89de0c26 #5)
+    let end = if timed_out {
+        "timed_out"
+    } else if !has_sig {
+        "crashed"
+    } else if !bits(st::INITED_OK) {
+        "init_failed"
+    } else if bits(st::RUNTIME_ABORT) {
+        "runtime_error"
+    } else if finished.as_deref() == Some("duration_reached") {
+        "completed"
+    } else {
+        "cancelled"
+    };
     if t.status == TestStatus::Fail && t.message.is_none() {
-        t.message = Some("memory errors detected by the Vulkan memtest".into());
+        t.message = Some(if end == "completed" {
+            "memory errors detected by the Vulkan memtest".into()
+        } else {
+            format!("memory errors detected by the Vulkan memtest; run then ended: {end}")
+        });
     }
-    t.termination = Some(
-        match t.status {
-            TestStatus::Fail => "mismatch",
-            TestStatus::Pass => "completed",
-            _ if timed_out => "timed_out",
-            _ if !has_sig => "crashed",
-            _ if !bits(st::INITED_OK) => "init_failed",
-            _ if bits(st::RUNTIME_ABORT) => "runtime_error",
-            _ => "cancelled",
-        }
-        .into(),
-    );
+    t.termination = Some(end.into());
     t
 }
 
-/// Terminal state vocabulary (Codex audit): completed, mismatch, runtime_error, device_lost,
-/// timed_out, crashed, init_failed, cancelled, unsupported.
-pub fn worker_termination(
-    status: TestStatus,
-    code: Option<i32>,
-    timed_out: bool,
-    ev: &[Value],
-) -> &'static str {
+/// Recorded mismatches make the test FAIL even if the run later timed out, lost the device
+/// or crashed (Codex BLOCK 89de0c26 #5). The later fault stays visible in `message`, and
+/// `termination` keeps how the run ended.
+pub fn latch_mismatches(t: &mut TestResult) {
+    if t.error_count == 0 || t.status == TestStatus::Fail {
+        return;
+    }
+    let later = t
+        .message
+        .take()
+        .unwrap_or_else(|| format!("{:?}", t.status).to_lowercase());
+    t.message = Some(format!(
+        "{} mismatch(es) recorded before the run ended ({later})",
+        t.error_count
+    ));
+    t.status = TestStatus::Fail;
+}
+
+/// How a worker run ENDED (vocabulary: completed, runtime_error, device_lost, timed_out,
+/// crashed, identity_mismatch, unsupported). Mismatch evidence is judged separately.
+pub fn worker_termination(code: Option<i32>, timed_out: bool, ev: &[Value]) -> &'static str {
     let err = of_kind(ev, "worker_error").last();
     let flag = |k: &str| err.is_some_and(|e| e[k] == true);
-    match status {
-        TestStatus::Pass => "completed",
-        TestStatus::Fail if flag("ecc_uncorrectable") => "device_lost",
-        TestStatus::Fail => "mismatch",
-        TestStatus::Unsupported => "unsupported",
-        _ if timed_out || flag("timeout") => "timed_out",
-        _ if flag("device_lost") || flag("gpu_fault") => "device_lost",
-        _ if !matches!(code, Some(0..=4)) => "crashed",
-        _ => "runtime_error",
+    if timed_out || flag("timeout") {
+        "timed_out"
+    } else if flag("identity_mismatch") {
+        "identity_mismatch"
+    } else if flag("ecc_uncorrectable") || flag("device_lost") || flag("gpu_fault") {
+        "device_lost"
+    } else if flag("unsupported") {
+        "unsupported"
+    } else {
+        match code {
+            Some(0) | Some(1) => "completed",
+            Some(2) | Some(4) => "runtime_error",
+            _ => "crashed",
+        }
     }
 }
 
@@ -257,7 +289,7 @@ pub fn judge_cuda(
             })
             .collect::<serde_json::Map<String, Value>>(),
     );
-    t.error_count = passes.iter().filter_map(|p| p["errors"].as_u64()).sum();
+    t.error_count = cuda_error_count(ev);
     if let Some(s) = of_kind(ev, "cuda_summary").last() {
         t.set_metric("rounds_completed", s["rounds_completed"].clone());
         t.set_metric("bit_histogram", s["bit_histogram"].clone());
@@ -281,11 +313,28 @@ pub fn judge_cuda(
             ..Default::default()
         });
     }
-    if t.error_count > 0 && t.status == TestStatus::Pass {
-        t.status = TestStatus::Fail;
-    }
-    t.termination = Some(worker_termination(t.status, code, timed_out, ev).into());
+    t.termination = Some(worker_termination(code, timed_out, ev).into());
+    latch_mismatches(&mut t);
     t
+}
+
+/// Errors of completed passes from their aggregate, plus per-op / canary evidence of passes
+/// that never completed (worker died mid-pass) - each mismatch counted exactly once.
+pub fn cuda_error_count(ev: &[Value]) -> u64 {
+    let key = |e: &Value| (e["round"].as_u64(), e["pass"].as_str().map(String::from));
+    let completed: std::collections::BTreeSet<_> = of_kind(ev, "cuda_pass").map(key).collect();
+    let done: u64 = of_kind(ev, "cuda_pass")
+        .filter_map(|p| p["errors"].as_u64())
+        .sum();
+    let unfinished_ops: u64 = of_kind(ev, "cuda_op_errors")
+        .filter(|e| !completed.contains(&key(e)))
+        .filter_map(|e| e["errors"].as_u64())
+        .sum();
+    let unfinished_canary: u64 = of_kind(ev, "cuda_canary_mismatch")
+        .filter(|e| !completed.contains(&key(e)))
+        .filter_map(|e| e["mismatched_words"].as_u64())
+        .sum();
+    done + unfinished_ops + unfinished_canary
 }
 
 #[cfg(test)]
@@ -437,6 +486,80 @@ mod tests {
         ];
         let t = judge_cuda(TestResult::new("vram", "cuda", "c"), Some(2), false, &ev);
         assert_eq!(t.status, TestStatus::Fail);
+    }
+
+    #[test]
+    fn mismatches_dominate_a_later_fault() {
+        // compute/transfer style: errors recorded, then the worker timed out / lost the device
+        let mut t = TestResult::new("compute", "vulkan", "vulkan_compute");
+        (t.status, t.message) = worker_status(None, true, &[]);
+        t.error_count = 4;
+        latch_mismatches(&mut t);
+        assert_eq!(t.status, TestStatus::Fail);
+        assert!(
+            t.message
+                .as_deref()
+                .unwrap()
+                .contains("4 mismatch(es) recorded")
+        );
+        assert!(t.message.as_deref().unwrap().contains("deadline"));
+        // no errors: the incomplete status stands
+        let mut t = TestResult::new("compute", "vulkan", "vulkan_compute");
+        (t.status, t.message) = worker_status(Some(2), false, &[]);
+        latch_mismatches(&mut t);
+        assert_eq!(t.status, TestStatus::Incomplete);
+    }
+
+    #[test]
+    fn cuda_unfinished_pass_evidence_counts_once() {
+        let ev = vec![
+            json!({"ev": "cuda_op_errors", "round": 0, "pass": "own_address", "errors": 2}),
+            json!({"ev": "cuda_pass", "round": 0, "pass": "own_address", "errors": 2, "gbps": 1.0}),
+            // pass 2 died after its first verify + a canary mismatch: never aggregated
+            json!({"ev": "cuda_canary_mismatch", "round": 0, "pass": "moving_inversions", "mismatched_words": 1}),
+            json!({"ev": "cuda_op_errors", "round": 0, "pass": "moving_inversions", "errors": 5}),
+            json!({"ev": "worker_error", "message": "lost", "gpu_fault": true}),
+        ];
+        assert_eq!(cuda_error_count(&ev), 2 + 5 + 1);
+        let t = judge_cuda(TestResult::new("vram", "cuda", "c"), Some(2), false, &ev);
+        assert_eq!(t.status, TestStatus::Fail);
+        assert_eq!(t.error_count, 8);
+        assert_eq!(t.termination.as_deref(), Some("device_lost"));
+    }
+
+    #[test]
+    fn memtest_errors_then_timeout_is_fail_with_end_reason() {
+        let arrays = ([0u32; 32], [0u32; 32], [1u32; 32]);
+        let r = crate::hooks::ErrorReport {
+            iteration: 2,
+            mode: "INITIAL_READ",
+            window_offset: 0,
+            window_bytes: 1 << 20,
+            idx_min: 0,
+            idx_max: 0,
+            single_bit_idx: &arrays.0,
+            toggle_count: &arrays.1,
+            ones_in_value: &arrays.2,
+            actual_ff: 0,
+            actual_min: 1,
+            actual_max: 1,
+        };
+        let ev = parse(&[crate::hooks::format_error(1.0, &r)]);
+        let t = judge_memtest(mt(), None, true, &ev);
+        assert_eq!(t.status, TestStatus::Fail);
+        assert_eq!(t.termination.as_deref(), Some("timed_out"));
+        assert!(t.message.unwrap().contains("run then ended: timed_out"));
+    }
+
+    #[test]
+    fn identity_mismatch_stops_init() {
+        let ev = vec![
+            json!({"ev": "memtest_identity_mismatch", "message": "expected PCI 0000:c1:00.0, selected device is 0000:81:00.0"}),
+        ];
+        match init_outcome(Some(64), &ev, 0) {
+            InitOutcome::Stop(m) => assert!(m.contains("identity mismatch")),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

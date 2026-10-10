@@ -48,6 +48,10 @@ pub struct Report {
     pub verdict: Option<Verdict>,
     pub reasons: Vec<String>,
     pub warnings: Vec<String>,
+    /// set when the run was refused before testing (safety gate, selection); verdict is null
+    pub refusal: Option<String>,
+    /// set when the run could not proceed for an operational reason (inventory failure, ...)
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -77,6 +81,8 @@ pub struct DeviceInfo {
     pub index_pci_order: usize,
     /// Upstream memtest_vulkan label number (1-based, descending-bus order).
     pub vk_label: usize,
+    /// nvidia-smi index (NVML, joined by PCI id); null without NVML
+    pub nvml_index: Option<u32>,
     pub pci_bus_id: String,
     pub uuid: Option<String>,
     pub name: String,
@@ -294,9 +300,12 @@ pub fn decide(tests: &[TestResult], h: &HealthFindings) -> (Verdict, Vec<String>
         }
     }
 
+    // PASS needs at least one test that actually ran to completion (BLOCK 89de0c26 #6):
+    // all-unsupported / all-skipped is "no evidence", not "healthy"
+    let none_completed = !tests.iter().any(|t| t.status == TestStatus::Pass);
     let verdict = if !reasons.is_empty() {
         Verdict::Fail
-    } else if tests.is_empty()
+    } else if none_completed
         || tests
             .iter()
             .any(|t| matches!(t.status, TestStatus::Incomplete | TestStatus::Error))
@@ -313,6 +322,8 @@ pub fn decide(tests: &[TestResult], h: &HealthFindings) -> (Verdict, Vec<String>
         }
         if tests.is_empty() {
             reasons.push("no test ran".into());
+        } else if none_completed {
+            reasons.push("no test completed (all unsupported / skipped / failed to run)".into());
         }
         Verdict::Incomplete
     } else {
@@ -420,6 +431,24 @@ mod tests {
         let (v, _, w) = decide(&[t], &HealthFindings::default());
         assert_eq!(v, Verdict::Pass);
         assert!(w[0].contains("not a full-card result"), "{w:?}");
+    }
+
+    #[test]
+    fn all_unsupported_or_skipped_is_not_a_pass() {
+        for st in [TestStatus::Unsupported, TestStatus::Skipped] {
+            let (v, r, _) = decide(&[test_with(st), test_with(st)], &HealthFindings::default());
+            assert_eq!(v, Verdict::Incomplete, "{st:?}");
+            assert!(r.iter().any(|x| x.contains("no test completed")), "{r:?}");
+        }
+        // one real pass next to unsupported tests is still a pass
+        let (v, _, _) = decide(
+            &[
+                test_with(TestStatus::Pass),
+                test_with(TestStatus::Unsupported),
+            ],
+            &HealthFindings::default(),
+        );
+        assert_eq!(v, Verdict::Pass);
     }
 
     #[test]

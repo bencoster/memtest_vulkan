@@ -6,13 +6,14 @@
 //! decoded frame count == N. The GPU is pinned with CUDA_VISIBLE_DEVICES=<UUID>
 //! plus `-gpu 0`, independent of enumeration order.
 
+use super::proc::{self, Limits};
 use super::report::{TestResult, TestStatus};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 pub const MIN_PSNR_DB: f64 = 30.0;
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const CODECS: &[(&str, &str, &str)] = &[
     ("h264", "h264_nvenc", "h264_cuvid"),
     ("hevc", "hevc_nvenc", "hevc_cuvid"),
@@ -155,43 +156,19 @@ fn tail(s: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join(" | ")
 }
 
-/// Runs a child with a timeout, capturing stderr. Ok((success, stderr)).
-pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<(bool, String), String> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn failed: {e}"))?;
-    let mut err_pipe = child.stderr.take().ok_or("no stderr pipe")?;
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf);
-        s.push_str(&String::from_utf8_lossy(&buf));
-        s
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stderr = reader.join().unwrap_or_default();
-                return Ok((status.success(), stderr));
-            }
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let stderr = reader.join().unwrap_or_default();
-                return Err(format!(
-                    "timed out after {}s: {}",
-                    timeout.as_secs(),
-                    tail(&stderr, 3)
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => return Err(format!("wait failed: {e}")),
-        }
+/// Runs a child under `proc` (bounded wait, kill and pipe drain; contained), capturing
+/// stderr. Ok((success, stderr)); Err on spawn failure or timeout (BLOCK 89de0c26 #1).
+pub fn run_with_timeout(cmd: Command, timeout: Duration) -> Result<(bool, String), String> {
+    let o = proc::run(cmd, &Limits::new(timeout), false, true)?;
+    if o.timed_out {
+        return Err(format!(
+            "timed out after {}s: {}{}",
+            timeout.as_secs(),
+            tail(&o.stderr, 3),
+            o.death_note().map(|n| format!("; {n}")).unwrap_or_default()
+        ));
     }
+    Ok((o.exit_code == Some(0), o.stderr))
 }
 
 fn ffmpeg_cmd(ffmpeg: &Path, uuid: &str, args: &[String]) -> Command {
@@ -202,14 +179,30 @@ fn ffmpeg_cmd(ffmpeg: &Path, uuid: &str, args: &[String]) -> Command {
     c
 }
 
-fn list_codecs(ffmpeg: &Path, flag: &str) -> String {
+/// Capability discovery; a failing/hanging ffmpeg is an ERROR, not "no codecs" (BLOCK #6).
+fn list_codecs(ffmpeg: &Path, flag: &str) -> Result<String, String> {
     let mut c = Command::new(ffmpeg);
     c.args(["-hide_banner", flag]);
-    let mut out = String::new();
-    if let Ok(o) = c.stdin(Stdio::null()).output() {
-        out.push_str(&String::from_utf8_lossy(&o.stdout));
+    let o = proc::run(c, &Limits::new(DISCOVERY_TIMEOUT), true, true)?;
+    discovery_result(&o, flag)
+}
+
+/// Pure judgement of a discovery run (unit-tested).
+pub fn discovery_result(o: &proc::Outcome, flag: &str) -> Result<String, String> {
+    if o.timed_out {
+        return Err(format!("ffmpeg {flag} timed out"));
     }
-    out
+    if o.exit_code != Some(0) {
+        return Err(format!(
+            "ffmpeg {flag} failed (exit {:?}): {}",
+            o.exit_code,
+            tail(&o.stderr, 2)
+        ));
+    }
+    if !o.stdout.contains("------") {
+        return Err(format!("ffmpeg {flag} produced no codec table"));
+    }
+    Ok(o.stdout.clone())
 }
 
 fn has_codec(listing: &str, name: &str) -> bool {
@@ -344,8 +337,21 @@ pub fn run(
         }
         return results;
     };
-    let encoders = list_codecs(&ffmpeg, "-encoders");
-    let decoders = list_codecs(&ffmpeg, "-decoders");
+    let listings = list_codecs(&ffmpeg, "-encoders")
+        .and_then(|e| list_codecs(&ffmpeg, "-decoders").map(|d| (e, d)));
+    let (encoders, decoders) = match listings {
+        Ok(v) => v,
+        Err(e) => {
+            for (codec, _, _) in CODECS {
+                let mut t = new(codec);
+                t.status = TestStatus::Error;
+                t.termination = Some("runtime_error".into());
+                t.message = Some(format!("capability discovery failed: {e}"));
+                results.push(t);
+            }
+            return results;
+        }
+    };
     let timeout = Duration::from_secs(60 + frames as u64 / 10);
     for (codec, enc, dec) in CODECS {
         let mut t = new(codec);
@@ -479,6 +485,47 @@ mod tests {
         let graph = &d[d.iter().position(|a| a == "-filter_complex").unwrap() + 1];
         assert!(graph.contains("trim=end_frame=150"));
         assert!(graph.contains("psnr=shortest=1"));
+    }
+
+    #[test]
+    fn discovery_failure_is_distinguished_from_unsupported() {
+        let ok = proc::Outcome {
+            exit_code: Some(0),
+            stdout: " ------\n V....D h264_nvenc NVIDIA NVENC\n".into(),
+            dead_confirmed: true,
+            pipes_complete: true,
+            ..Default::default()
+        };
+        assert!(discovery_result(&ok, "-encoders").is_ok());
+        let failed = proc::Outcome {
+            exit_code: Some(1),
+            stderr: "dll missing".into(),
+            ..ok.clone()
+        };
+        assert!(
+            discovery_result(&failed, "-encoders")
+                .unwrap_err()
+                .contains("failed")
+        );
+        let hung = proc::Outcome {
+            timed_out: true,
+            exit_code: None,
+            ..ok.clone()
+        };
+        assert!(
+            discovery_result(&hung, "-encoders")
+                .unwrap_err()
+                .contains("timed out")
+        );
+        let empty = proc::Outcome {
+            stdout: String::new(),
+            ..ok
+        };
+        assert!(
+            discovery_result(&empty, "-encoders")
+                .unwrap_err()
+                .contains("no codec table")
+        );
     }
 
     #[test]

@@ -20,6 +20,12 @@ use std::{
 pub const ENV_EVENTS: &str = "MEMTEST_VULKAN_EVENTS";
 /// Stop the memtest loop this many seconds after the first test iteration starts.
 pub const ENV_STOP_AFTER_S: &str = "MEMTEST_VULKAN_STOP_AFTER_S";
+/// Identity the orchestrator approved; the child refuses any other device (BLOCK 89de0c26 #2).
+pub const ENV_EXPECT_PCI: &str = "MEMTEST_VULKAN_EXPECT_PCI";
+pub const ENV_EXPECT_UUID: &str = "MEMTEST_VULKAN_EXPECT_UUID";
+/// Hard wall-clock limit for the whole child, enforced by a watchdog thread even if the
+/// test loop is stuck in a driver call or the orchestrator died (BLOCK 89de0c26 #1).
+pub const ENV_HARD_DEADLINE_S: &str = "MEMTEST_VULKAN_HARD_DEADLINE_S";
 
 struct State {
     file: Option<Mutex<File>>,
@@ -29,7 +35,34 @@ struct State {
 
 fn state() -> &'static State {
     static STATE: OnceLock<State> = OnceLock::new();
-    STATE.get_or_init(|| State {
+    STATE.get_or_init(|| {
+        arm_hard_deadline();
+        new_state()
+    })
+}
+
+fn arm_hard_deadline() {
+    let Some(limit) = std::env::var(ENV_HARD_DEADLINE_S)
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| *s > 0.0)
+    else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("memtest-hard-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs_f64(limit));
+            emit(&format!(
+                "{{\"ev\":\"memtest_hard_deadline\",\"t_s\":{:.3},\"limit_s\":{limit}}}",
+                elapsed_s()
+            ));
+            crate::close::immediate_exit(true);
+        });
+}
+
+fn new_state() -> State {
+    State {
         file: std::env::var_os(ENV_EVENTS)
             .and_then(|path| {
                 std::fs::OpenOptions::new()
@@ -45,7 +78,81 @@ fn state() -> &'static State {
             .filter(|s| *s > 0.0)
             .map(Duration::from_secs_f64),
         start: Mutex::new(None),
-    })
+    }
+}
+
+/// `dddd:bb:dd.f`, the PCI id format used by the orchestrator.
+pub fn pci_string(domain: u32, bus: u32, device: u32, function: u32) -> String {
+    format!("{domain:04x}:{bus:02x}:{device:02x}.{function:x}")
+}
+
+/// Formats a 16-byte UUID the way NVML / nvidia-smi / CUDA_VISIBLE_DEVICES do.
+pub fn uuid_string(b: &[u8; 16]) -> String {
+    let h: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "GPU-{}-{}-{}-{}-{}",
+        h[0..4].concat(),
+        h[4..6].concat(),
+        h[6..8].concat(),
+        h[8..10].concat(),
+        h[10..16].concat()
+    )
+}
+
+/// Pure identity comparison (unit-tested): Ok when nothing is expected or everything matches.
+pub fn identity_verdict(
+    expected_pci: Option<&str>,
+    expected_uuid: Option<&str>,
+    actual_pci: &str,
+    actual_uuid: Option<&str>,
+) -> Result<(), String> {
+    if let Some(p) = expected_pci {
+        if actual_pci == "0000:00:00.0" {
+            return Err(format!("device reports no PCI identity; expected {p}"));
+        }
+        if !actual_pci.eq_ignore_ascii_case(p) {
+            return Err(format!("expected PCI {p}, selected device is {actual_pci}"));
+        }
+    }
+    if let Some(u) = expected_uuid {
+        match actual_uuid {
+            Some(a) if a.eq_ignore_ascii_case(u) => {}
+            Some(a) => return Err(format!("expected UUID {u}, selected device has {a}")),
+            None => return Err(format!("expected UUID {u}, selected device reports none")),
+        }
+    }
+    Ok(())
+}
+
+/// Called by upstream's selection code before any device is created. Returns false (after
+/// emitting `memtest_identity_mismatch`) when the selected device is not the approved one.
+pub fn identity_ok(pci: (u32, u32, u32, u32), uuid: Option<[u8; 16]>) -> bool {
+    let _ = state(); // arms the hard-deadline watchdog before any device work
+    let expected_pci = std::env::var(ENV_EXPECT_PCI).ok();
+    let expected_uuid = std::env::var(ENV_EXPECT_UUID).ok();
+    if expected_pci.is_none() && expected_uuid.is_none() {
+        return true;
+    }
+    let actual_pci = pci_string(pci.0, pci.1, pci.2, pci.3);
+    let actual_uuid = uuid
+        .filter(|u| u.iter().any(|b| *b != 0))
+        .map(|u| uuid_string(&u));
+    match identity_verdict(
+        expected_pci.as_deref(),
+        expected_uuid.as_deref(),
+        &actual_pci,
+        actual_uuid.as_deref(),
+    ) {
+        Ok(()) => true,
+        Err(why) => {
+            emit(&format!(
+                "{{\"ev\":\"memtest_identity_mismatch\",\"t_s\":{:.3},\"message\":\"{}\"}}",
+                elapsed_s(),
+                json_escape(&why)
+            ));
+            false
+        }
+    }
 }
 
 fn elapsed_s() -> f64 {
@@ -278,6 +385,31 @@ mod tests {
         assert!(line.contains("\"mode\":\"INITIAL_READ\""));
         assert!(line.ends_with("]}"));
         assert_eq!(line.matches('[').count(), 3);
+    }
+
+    #[test]
+    fn identity_verdict_cases() {
+        let ok = identity_verdict(
+            Some("0000:c1:00.0"),
+            Some("GPU-a"),
+            "0000:c1:00.0",
+            Some("gpu-A"),
+        );
+        assert!(ok.is_ok());
+        assert!(identity_verdict(None, None, "0000:00:00.0", None).is_ok());
+        assert!(
+            identity_verdict(Some("0000:c1:00.0"), None, "0000:81:00.0", None)
+                .unwrap_err()
+                .contains("selected device is 0000:81:00.0")
+        );
+        assert!(
+            identity_verdict(Some("0000:00:00.0"), None, "0000:00:00.0", None)
+                .unwrap_err()
+                .contains("no PCI identity")
+        );
+        assert!(identity_verdict(None, Some("GPU-a"), "0000:c1:00.0", Some("GPU-b")).is_err());
+        assert!(identity_verdict(None, Some("GPU-a"), "0000:c1:00.0", None).is_err());
+        assert_eq!(pci_string(0, 0xc1, 0, 0), "0000:c1:00.0");
     }
 
     #[test]

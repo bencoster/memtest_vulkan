@@ -1,20 +1,39 @@
 //! Telemetry samples, health snapshots, and the pure logic turning them into
 //! report summaries and verdict inputs (docs/bcll/DESIGN.md sections 5, 6, 8).
-//! The sampling thread is generic over `Sampler` so this file needs no NVML.
+//! The sampling loop (run by the telemetry WORKER process, see query.rs) is generic over
+//! `Sampler` so this file needs no NVML.
 
 use super::aer::{self, AerSnapshot};
 use super::report::HealthFindings;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
 use std::time::{Duration, Instant};
 
 pub const MAX_SAMPLES: usize = 100_000;
 pub const MAX_LINK_CHANGES: usize = 200;
 pub const BUSY_UTIL_PCT: u32 = 50;
+
+/// Display evidence (BLOCK 89de0c26 #3): attached if EITHER query says so; detached only
+/// when BOTH queries answered "no"; anything else is unknown.
+#[cfg_attr(not(any(feature = "nvml", test)), allow(dead_code))]
+pub fn display_from(active: Option<bool>, connected: Option<bool>) -> Option<bool> {
+    match (active, connected) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+/// Memory occupancy evidence for the safety gate and coverage accounting.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct Usage {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub reserved_bytes: Option<u64>,
+    /// None = the process query failed (unknown), Some([]) = verified none.
+    pub compute_pids: Option<Vec<u32>>,
+}
 
 /// Counters that only grow; compared before vs after a run.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -448,70 +467,34 @@ pub trait Sampler {
     fn sample(&mut self, t_s: f64) -> Sample;
 }
 
-pub struct Handle {
-    stop: Arc<AtomicBool>,
-    samples: Arc<Mutex<Vec<Sample>>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Handle {
-    pub fn snapshot(&self) -> Vec<Sample> {
-        self.samples
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    pub fn stop(mut self) -> Vec<Sample> {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+/// Samples every `interval` until `until`, printing a line every `print_every` and handing
+/// each sample to `sink`. Runs in the telemetry worker process; returns the sample count.
+pub fn run_loop(
+    sampler: &mut dyn Sampler,
+    interval: Duration,
+    print_every: Duration,
+    until: Instant,
+    mut sink: impl FnMut(&Sample),
+) -> usize {
+    let start = Instant::now();
+    let mut last_print: Option<Instant> = None;
+    let mut first: Option<Sample> = None;
+    let mut n = 0;
+    while Instant::now() < until && n < MAX_SAMPLES {
+        let tick = Instant::now();
+        let s = sampler.sample(start.elapsed().as_secs_f64());
+        let first_ref = first.get_or_insert_with(|| s.clone());
+        if last_print.is_none_or(|p| p.elapsed() >= print_every) {
+            println!("{}", format_line(&s, first_ref));
+            last_print = Some(Instant::now());
         }
-        self.snapshot()
+        sink(&s);
+        n += 1;
+        while tick.elapsed() < interval && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20).min(interval));
+        }
     }
-}
-
-/// Starts the sampling thread. `make` runs on that thread (NVML/NVAPI handles stay thread-local).
-pub fn start<F>(interval: Duration, print_every: Duration, make: F) -> Handle
-where
-    F: FnOnce() -> Option<Box<dyn Sampler>> + Send + 'static,
-{
-    let stop = Arc::new(AtomicBool::new(false));
-    let samples = Arc::new(Mutex::new(Vec::new()));
-    let (stop_t, samples_t) = (stop.clone(), samples.clone());
-    let thread = std::thread::Builder::new()
-        .name("bcll-telemetry".into())
-        .spawn(move || {
-            let Some(mut sampler) = make() else { return };
-            let start = Instant::now();
-            let mut last_print: Option<Instant> = None;
-            let mut first: Option<Sample> = None;
-            while !stop_t.load(Ordering::SeqCst) {
-                let tick = Instant::now();
-                let s = sampler.sample(start.elapsed().as_secs_f64());
-                let first_ref = first.get_or_insert_with(|| s.clone()).clone();
-                if last_print.is_none_or(|p| p.elapsed() >= print_every) {
-                    println!("{}", format_line(&s, &first_ref));
-                    last_print = Some(Instant::now());
-                }
-                {
-                    let mut v = samples_t.lock().unwrap_or_else(|e| e.into_inner());
-                    if v.len() < MAX_SAMPLES {
-                        v.push(s);
-                    }
-                }
-                // sleep in small steps so stop() returns promptly
-                while tick.elapsed() < interval && !stop_t.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(50).min(interval));
-                }
-            }
-        })
-        .ok();
-    Handle {
-        stop,
-        samples,
-        thread,
-    }
+    n
 }
 
 #[cfg(test)]
@@ -623,15 +606,18 @@ mod tests {
     }
 
     #[test]
-    fn thread_collects_and_stops() {
-        let h = start(
+    fn loop_samples_until_deadline() {
+        let mut f = Fake(0);
+        let mut got = Vec::new();
+        let n = run_loop(
+            &mut f,
             Duration::from_millis(100),
             Duration::from_secs(3600),
-            || Some(Box::new(Fake(0)) as Box<dyn Sampler>),
+            Instant::now() + Duration::from_millis(350),
+            |s| got.push(s.clone()),
         );
-        std::thread::sleep(Duration::from_millis(350));
-        let v = h.stop();
-        assert!(v.len() >= 2, "{}", v.len());
-        assert!(v.windows(2).all(|w| w[1].t_s >= w[0].t_s));
+        assert!((3..=5).contains(&n), "{n}");
+        assert_eq!(got.len(), n);
+        assert!(got.windows(2).all(|w| w[1].t_s >= w[0].t_s));
     }
 }

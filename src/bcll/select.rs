@@ -19,6 +19,8 @@ pub struct Candidate {
     pub pci: PciAddress,
     pub uuid: Option<String>,
     pub vk_label: usize,
+    /// NVML index (= nvidia-smi index), joined by PCI id; None without NVML / non-NVIDIA.
+    pub nvml_index: Option<u32>,
 }
 
 pub fn format_pci(p: &PciAddress) -> String {
@@ -60,15 +62,53 @@ pub fn parse_pci(s: &str) -> Option<PciAddress> {
 
 /// Formats a 16-byte UUID the way NVML / nvidia-smi / CUDA_VISIBLE_DEVICES do.
 pub fn uuid_string(b: &[u8; 16]) -> String {
-    let h: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!(
-        "GPU-{}-{}-{}-{}-{}",
-        h[0..4].concat(),
-        h[4..6].concat(),
-        h[6..8].concat(),
-        h[8..10].concat(),
-        h[10..16].concat()
-    )
+    crate::hooks::uuid_string(b)
+}
+
+/// An all-zero address means the driver did not report PCI info: never an identity.
+pub fn pci_known(p: &PciAddress) -> bool {
+    (p.domain, p.bus, p.device, p.function) != (0, 0, 0, 0)
+}
+
+/// Re-resolves the approved card inside a worker process (Codex BLOCK 89de0c26 #2):
+/// `cands` = (pci id, uuid) of the devices this process enumerated, in any order.
+/// Exactly one must match the expected full PCI id, and its UUID must match when one
+/// is expected. Missing, ambiguous or mismatching identity is refused.
+pub fn pick_by_identity(
+    cands: &[(String, Option<String>)],
+    expected_pci: &str,
+    expected_uuid: Option<&str>,
+) -> Result<usize, String> {
+    let want = parse_pci(expected_pci)
+        .filter(pci_known)
+        .ok_or_else(|| format!("expected PCI id '{expected_pci}' is not a usable identity"))?;
+    let want_s = format_pci(&want);
+    let hits: Vec<usize> = (0..cands.len()).filter(|i| cands[*i].0 == want_s).collect();
+    let i = match hits.as_slice() {
+        [one] => *one,
+        [] => {
+            return Err(format!(
+                "approved GPU {want_s} is not present in this process's enumeration"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "PCI id {want_s} is ambiguous in this process's enumeration"
+            ));
+        }
+    };
+    if let Some(u) = expected_uuid {
+        match &cands[i].1 {
+            Some(actual) if actual.eq_ignore_ascii_case(u) => {}
+            Some(actual) => {
+                return Err(format!(
+                    "identity mismatch at {want_s}: expected {u}, found {actual}"
+                ));
+            }
+            None => return Err(format!("device at {want_s} reports no UUID; expected {u}")),
+        }
+    }
+    Ok(i)
 }
 
 pub fn parse_spec(raw: &str) -> Result<Spec, String> {
@@ -132,10 +172,19 @@ pub fn pci_order(cands: &[Candidate]) -> Vec<usize> {
 /// Returns the position in `cands` matching `spec`.
 pub fn select(cands: &[Candidate], spec: &Spec) -> Result<usize, String> {
     match spec {
-        Spec::Index(n) => pci_order(cands)
-            .get(*n)
-            .copied()
-            .ok_or_else(|| format!("GPU index {n} out of range ({} GPU(s) found)", cands.len())),
+        // A bare index is the nvidia-smi / NVML index, resolved by stable identity (Codex
+        // BLOCK 89de0c26 #7) - never a position in some other enumeration.
+        Spec::Index(n) => {
+            if cands.iter().all(|c| c.nvml_index.is_none()) {
+                return Err(format!(
+                    "GPU index {n} means the nvidia-smi index, which needs NVML (unavailable); select by PCI address or UUID"
+                ));
+            }
+            cands
+                .iter()
+                .position(|c| c.nvml_index == Some(*n as u32))
+                .ok_or_else(|| format!("no GPU with nvidia-smi index {n}"))
+        }
         Spec::VkLabel(n) => cands
             .iter()
             .position(|c| c.vk_label == *n)
@@ -195,21 +244,25 @@ mod tests {
                 pci: pci(0xC1),
                 uuid: Some("GPU-514405d5-9dda-22a9-2f0c-52e4e26adb0f".into()),
                 vk_label: 1,
+                nvml_index: Some(3),
             },
             Candidate {
                 pci: pci(0x82),
                 uuid: Some("GPU-5d837ee0-189d-961a-8ea2-253fa75c1554".into()),
                 vk_label: 2,
+                nvml_index: Some(2),
             },
             Candidate {
                 pci: pci(0x81),
                 uuid: Some("GPU-67271087-a085-99c3-04af-175497ab1f95".into()),
                 vk_label: 3,
+                nvml_index: Some(1),
             },
             Candidate {
                 pci: pci(0x01),
                 uuid: Some("GPU-3836e883-2ccf-da1f-e38b-8b2d9d0a6ab3".into()),
                 vk_label: 4,
+                nvml_index: Some(0),
             },
         ]
     }
@@ -233,6 +286,102 @@ mod tests {
             0xC1
         );
         assert!(select(&c, &Spec::Index(4)).is_err());
+    }
+
+    #[test]
+    fn index_is_the_nvml_index_not_a_position() {
+        let mut c = rig();
+        // a driver may number cards differently from PCI order: the NVML index wins
+        c[0].nvml_index = Some(0); // C1 claims index 0
+        c[3].nvml_index = Some(3);
+        assert_eq!(
+            c[select(&c, &parse_spec("0").unwrap()).unwrap()].pci.bus,
+            0xC1
+        );
+        assert!(
+            select(&c, &Spec::Index(7))
+                .unwrap_err()
+                .contains("nvidia-smi index 7")
+        );
+        // without NVML a bare index is refused instead of guessed
+        for x in c.iter_mut() {
+            x.nvml_index = None;
+        }
+        assert!(
+            select(&c, &Spec::Index(0))
+                .unwrap_err()
+                .contains("needs NVML")
+        );
+        // PCI / UUID selection still works without NVML
+        assert!(select(&c, &parse_spec("81:00.0").unwrap()).is_ok());
+    }
+
+    fn enumerated(order: &[(u32, &str)]) -> Vec<(String, Option<String>)> {
+        order
+            .iter()
+            .map(|(bus, u)| (format_pci(&pci(*bus)), Some(u.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn workers_reresolve_identity_in_any_enumeration_order() {
+        let a = enumerated(&[
+            (0xC1, "GPU-c1"),
+            (0x82, "GPU-82"),
+            (0x81, "GPU-81"),
+            (0x01, "GPU-01"),
+        ]);
+        let reordered = enumerated(&[
+            (0x81, "GPU-81"),
+            (0x01, "GPU-01"),
+            (0xC1, "GPU-c1"),
+            (0x82, "GPU-82"),
+        ]);
+        assert_eq!(pick_by_identity(&a, "0000:c1:00.0", Some("GPU-c1")), Ok(0));
+        assert_eq!(
+            pick_by_identity(&reordered, "0000:c1:00.0", Some("GPU-C1")),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn workers_refuse_missing_ambiguous_or_mismatching_identity() {
+        // card disappeared: an ordinal handoff would have picked another card (maybe the display)
+        let reduced = enumerated(&[(0x81, "GPU-81"), (0x01, "GPU-01")]);
+        assert!(
+            pick_by_identity(&reduced, "0000:c1:00.0", Some("GPU-c1"))
+                .unwrap_err()
+                .contains("not present")
+        );
+        // same PCI slot, different board (swap) -> UUID mismatch
+        let swapped = enumerated(&[(0xC1, "GPU-other")]);
+        assert!(
+            pick_by_identity(&swapped, "0000:c1:00.0", Some("GPU-c1"))
+                .unwrap_err()
+                .contains("mismatch")
+        );
+        // driver without PCI info reports zeros for every device
+        let zeros = vec![
+            ("0000:00:00.0".to_string(), None),
+            ("0000:00:00.0".to_string(), None),
+        ];
+        assert!(
+            pick_by_identity(&zeros, "0000:00:00.0", None)
+                .unwrap_err()
+                .contains("not a usable identity")
+        );
+        let dup = enumerated(&[(0xC1, "GPU-a"), (0xC1, "GPU-b")]);
+        assert!(
+            pick_by_identity(&dup, "c1:00.0", None)
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        let no_uuid = vec![(format_pci(&pci(0xC1)), None)];
+        assert!(
+            pick_by_identity(&no_uuid, "c1:00.0", Some("GPU-c1"))
+                .unwrap_err()
+                .contains("no UUID")
+        );
     }
 
     #[test]

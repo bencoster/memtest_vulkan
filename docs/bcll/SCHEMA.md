@@ -29,6 +29,8 @@ nullable), never renamed, removed or re-typed. Readers must ignore unknown keys.
 | `telemetry` | object or null | `interval_ms`, `sources[]`, `memory_junction_source`, `summary`, `samples[]` |
 | `verdict` | `PASS` / `FAIL` / `INCOMPLETE` / null | null for `--info` (no test) |
 | `reasons[]` | strings | why FAIL / INCOMPLETE |
+| `refusal` | string or null | set when the run was refused before testing (gate / selection); verdict null |
+| `error` | string or null | set when the run could not proceed (inventory failure, work dir, ...) |
 | `warnings[]` | strings | non-fatal findings (replays, corrected ECC, throttling, junction ≥100 °C, unsupported tests, VRAM coverage < 85 %, telemetry unavailable) |
 
 Verdict rules: DESIGN.md §8.
@@ -38,7 +40,8 @@ Verdict rules: DESIGN.md §8.
 | Key | Notes |
 |---|---|
 | `selector` | what was passed to `--gpu` |
-| `index_pci_order` | equals the nvidia-smi index / `CUDA_DEVICE_ORDER=PCI_BUS_ID` |
+| `nvml_index` | the **nvidia-smi index**, from NVML joined by PCI id; null without NVML |
+| `index_pci_order` | position in PCI-address order among Vulkan GPUs (informational; not a selector) |
 | `vk_label` | upstream memtest_vulkan label (descending PCI bus) |
 | `pci_bus_id` | `dddd:bb:dd.f`, lower case |
 | `uuid` | `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (NVML, else Vulkan deviceUUID) |
@@ -103,7 +106,7 @@ Verdict rules: DESIGN.md §8.
 | `errors[]` | at most 1024 records; `errors_truncated` true if more |
 | `metrics` | free-form per test (below) |
 | `message` | human explanation for non-pass |
-| `termination` | completed / mismatch / runtime_error / device_lost / timed_out / crashed / init_failed / cancelled / unsupported |
+| `termination` | how the run ENDED: completed / runtime_error / device_lost / timed_out / crashed / init_failed / identity_mismatch / cancelled / unsupported. Independent of `status`: mismatches make `status` fail even when termination is e.g. `timed_out`. |
 
 **Error record:**
 
@@ -158,10 +161,15 @@ output contract. Every line has `ev` and `t_s`.
 
 | Source | Events |
 |---|---|
-| upstream memtest child (`src/hooks.rs`) | `memtest_started`, `memtest_error`, `memtest_progress`, `memtest_finished`, `memtest_init_failure{message}` |
+| upstream memtest child (`src/hooks.rs`) | `memtest_started`, `memtest_error`, `memtest_progress`, `memtest_finished`, `memtest_init_failure{message}`, `memtest_identity_mismatch{message}`, `memtest_hard_deadline{limit_s}` |
+| telemetry worker | `telemetry_started{sources}`, `telemetry_sample{…Sample fields}` |
+| query worker | none: one `BCLL-RESULT {json}` line on stdout |
 | Vulkan workers | `worker_started`, `compute_batch`, `compute_error`, `compute_summary`, `transfer_round`, `transfer_error`, `transfer_summary` |
-| CUDA worker | `cuda_coverage`, `cuda_pass`, `cuda_error`, `cuda_canary_mismatch`, `cuda_summary` |
-| all workers | `worker_finished`, `worker_error` (`device_lost`, `timeout`, `gpu_fault`, `ecc_uncorrectable`, `unsupported` flags) |
+| CUDA worker | `cuda_coverage`, `cuda_pass`, `cuda_op_errors` (exact count per verify op, so an unfinished pass still counts), `cuda_error`, `cuda_canary_mismatch`, `cuda_summary` |
+| all workers | `worker_finished`, `worker_error` (`device_lost`, `timeout`, `gpu_fault`, `ecc_uncorrectable`, `unsupported`, `identity_mismatch` flags) |
+
+Every test result also carries the metric `worker_dead_confirmed` (true / false): false means a killed
+worker did not confirm its death within the grace period.
 
 ## Mapping for the Python `gpu.vram_test`
 

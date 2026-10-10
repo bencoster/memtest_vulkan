@@ -37,6 +37,7 @@
         "selector": { "type": ["string", "null"] },
         "index_pci_order": { "type": "integer", "minimum": 0 },
         "vk_label": { "type": "integer" },
+        "nvml_index": { "type": ["integer", "null"], "description": "nvidia-smi index via NVML, joined by PCI id" },
         "pci_bus_id": { "type": "string", "pattern": "^[0-9a-f]{4,8}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$" },
         "uuid": { "type": ["string", "null"] },
         "name": { "type": "string" },
@@ -56,7 +57,9 @@
     "telemetry": { "type": ["object", "null"] },
     "verdict": { "enum": ["PASS", "FAIL", "INCOMPLETE", null] },
     "reasons": { "type": "array", "items": { "type": "string" } },
-    "warnings": { "type": "array", "items": { "type": "string" } }
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "refusal": { "type": ["string", "null"], "description": "run refused before testing (safety gate / selection); verdict null" },
+    "error": { "type": ["string", "null"], "description": "operational failure before or instead of testing" }
   },
   "$defs": {
     "health": {
@@ -103,7 +106,7 @@
         "errors_truncated": { "type": "boolean" },
         "metrics": { "type": "object" },
         "message": { "type": ["string", "null"] },
-        "termination": { "enum": ["completed", "mismatch", "runtime_error", "device_lost", "timed_out", "crashed", "init_failed", "cancelled", "unsupported", null] }
+        "termination": { "enum": ["completed", "mismatch", "runtime_error", "device_lost", "timed_out", "crashed", "init_failed", "identity_mismatch", "cancelled", "unsupported", null] }
       }
     },
     "error": {

@@ -1306,14 +1306,13 @@ struct NamedComputeDevice {
     memory_props: vk::PhysicalDeviceMemoryProperties,
     budget_props: ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXT,
     index_in_device_iteration: usize,
-    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pci: PciAddress,
-    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     device_uuid: Option<[u8; 16]>,
 }
 
 /// PCI location from VK_EXT_pci_bus_info (all zero when the driver lacks the extension).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "diagnostics", derive(serde::Serialize, serde::Deserialize))]
 pub struct PciAddress {
     pub domain: u32,
     pub bus: u32,
@@ -1914,6 +1913,18 @@ fn init_vk_and_check_errors<Writer: std::io::Write>(
         }
         Some(selected) => selected,
     };
+    // BCLL fork: an orchestrator-launched child must be on the approved card (identity, not ordinal)
+    if !hooks::identity_ok(
+        (
+            selected.pci.domain,
+            selected.pci.bus,
+            selected.pci.device,
+            selected.pci.function,
+        ),
+        selected.device_uuid,
+    ) {
+        return Err("selected device does not match the expected PCI id / UUID".into());
+    }
 
     try_fill_default_mem_budget(&selected, env, log_dupler);
     loaded_devices.devices = vec![selected];

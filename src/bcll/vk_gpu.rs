@@ -3,13 +3,14 @@
 //! slots with fences, buffer helpers, and FINITE fence waits (REVIEW R5).
 
 use erupt::{DeviceLoader, vk};
-use std::sync::atomic::Ordering::SeqCst;
 use std::time::{Duration, Instant};
 
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum GpuFault {
+    /// the approved card could not be re-resolved: nothing was created on any GPU
+    Identity(String),
     Timeout(&'static str),
     DeviceLost(&'static str),
     Other(String),
@@ -27,6 +28,7 @@ impl std::fmt::Display for GpuFault {
                 write!(f, "VK_ERROR_DEVICE_LOST during {w} (driver reset / Xid)")
             }
             GpuFault::Other(m) => f.write_str(m),
+            GpuFault::Identity(m) => write!(f, "identity check failed, no device created: {m}"),
         }
     }
 }
@@ -60,17 +62,28 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn open(vk_index: usize) -> Result<Gpu, GpuFault> {
-        let env = crate::ProcessEnv::default();
-        env.device_label.store(-1 - vk_index as isize, SeqCst);
+    /// Opens the approved card by IDENTITY (full PCI id + Vulkan device UUID), re-resolved in
+    /// this process before any device is created (Codex BLOCK 89de0c26 #2).
+    pub fn open(expected_pci: &str, expected_uuid: Option<&str>) -> Result<Gpu, GpuFault> {
+        let env = crate::ProcessEnv::default(); // label 0 = enumerate every device
         let mut log = crate::output::LogDupler::new(std::io::sink(), None, 0, "bcll worker");
         let loaded = crate::list_devices_ordered_labaled_from_1(&env, &mut log)
             .map_err(|e| GpuFault::Other(format!("Vulkan enumeration failed: {e}")))?;
-        let [dev] = loaded.devices.as_slice() else {
-            return Err(GpuFault::Other(format!(
-                "Vulkan device with enumeration index {vk_index} not found"
-            )));
-        };
+        let cands: Vec<(String, Option<String>)> = loaded
+            .devices
+            .iter()
+            .map(|d| {
+                (
+                    crate::bcll::select::format_pci(&d.pci),
+                    d.device_uuid
+                        .filter(|u| u.iter().any(|b| *b != 0))
+                        .map(|u| crate::bcll::select::uuid_string(&u)),
+                )
+            })
+            .collect();
+        let idx = crate::bcll::select::pick_by_identity(&cands, expected_pci, expected_uuid)
+            .map_err(GpuFault::Identity)?;
+        let dev = &loaded.devices[idx];
         let (phys, family, mem_props, label) = (
             dev.physical_device,
             dev.queue_family_index,
@@ -273,6 +286,30 @@ impl Drop for Gpu {
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
         }
+    }
+}
+
+/// Memory dependency from every earlier transfer/host access to this submission's transfer
+/// commands (Codex BLOCK 89de0c26 #4). Separate submissions + fence waits give execution
+/// ordering only; the write of one copy is not visible to the next copy without this.
+pub fn transfer_barrier(d: &DeviceLoader, cmd: vk::CommandBuffer) {
+    let barrier = [vk::MemoryBarrierBuilder::new()
+        .src_access_mask(
+            vk::AccessFlags::TRANSFER_WRITE
+                | vk::AccessFlags::TRANSFER_READ
+                | vk::AccessFlags::HOST_WRITE,
+        )
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)];
+    unsafe {
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &barrier,
+            &[],
+            &[],
+        );
     }
 }
 
