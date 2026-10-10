@@ -98,11 +98,20 @@ when ECC/remap deltas appear) and writes the output.
   death is reported (metric `worker_dead_confirmed`, a warning).
 - Pipes are drained on detached threads and collected with a bound, so a grandchild holding an inherited
   handle cannot hold the supervisor.
-- Containment:
-  - Windows: every child joins a kill-on-close Job Object.
-  - Linux: children get `PR_SET_PDEATHSIG=SIGKILL`.
-  - Every worker, including the upstream memtest child via `MEMTEST_VULKAN_HARD_DEADLINE_S`, also arms
-    its own hard deadline, so it ends even if the supervisor is dead or stuck.
+- Containment (re-done after BLOCK 5497b81c):
+  - Windows: before its first child, the supervisor puts *itself* into a kill-on-close Job Object and
+    verifies membership (`IsProcessInJob`). Every later child, ffmpeg included, is a member from
+    creation, so there is no spawn-then-assign window. Any setup failure is remembered, and every spawn
+    then **refuses** (fail closed).
+  - Linux: each child sets `PR_SET_PDEATHSIG=SIGKILL` in pre-exec. A `prctl` failure aborts the spawn,
+    and a `getppid()` check exits the child if the supervisor already died before the `prctl`.
+  - Every worker also arms its own hard deadline. The upstream memtest child arms
+    `MEMTEST_VULKAN_HARD_DEADLINE_S` as the first statement of `main()`, before the Vulkan loader or
+    any enumeration, so a stall there is bounded too.
+  - Tests use the test binary as a helper process:
+    - The helper supervisor exits abruptly after starting a 2-minute child; the child must be dead
+      within 10 s. A mutation check (containment disabled) makes this test fail.
+    - An upstream child stalled before any hook exits with SIGNATURE|RUNTIME_ABORT at its deadline.
 
 **Identity handoff (BLOCK #2).** Workers never receive an ordinal as their identity. Each one
 re-enumerates and selects the device whose full PCI id **and** Vulkan deviceUUID match. The CUDA worker

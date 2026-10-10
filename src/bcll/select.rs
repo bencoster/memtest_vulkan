@@ -4,8 +4,8 @@ use crate::PciAddress;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spec {
-    /// Position in PCI bus order (= nvidia-smi index on all-NVIDIA hosts).
-    Index(usize),
+    /// nvidia-smi (NVML) index; parsed as u32 so it can never wrap (BLOCK 5497b81c #3).
+    Index(u32),
     Pci(PciAddress),
     /// Upper-cased UUID or unique prefix, always starting with "GPU-".
     Uuid(String),
@@ -182,7 +182,7 @@ pub fn select(cands: &[Candidate], spec: &Spec) -> Result<usize, String> {
             }
             cands
                 .iter()
-                .position(|c| c.nvml_index == Some(*n as u32))
+                .position(|c| c.nvml_index == Some(*n))
                 .ok_or_else(|| format!("no GPU with nvidia-smi index {n}"))
         }
         Spec::VkLabel(n) => cands
@@ -286,6 +286,22 @@ mod tests {
             0xC1
         );
         assert!(select(&c, &Spec::Index(4)).is_err());
+    }
+
+    #[test]
+    fn oversized_indices_are_refused_not_wrapped() {
+        // 2^32 and 2^32+1 used to wrap to NVML index 0 / 1 (BLOCK 5497b81c #3)
+        for s in [
+            "4294967296",
+            "4294967297",
+            "index:4294967296",
+            "index:18446744073709551617",
+        ] {
+            assert!(parse_spec(s).is_err(), "{s} must be refused");
+        }
+        assert_eq!(parse_spec("4294967295").unwrap(), Spec::Index(u32::MAX));
+        let c = rig();
+        assert!(select(&c, &Spec::Index(u32::MAX)).is_err());
     }
 
     #[test]

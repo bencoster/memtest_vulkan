@@ -2119,6 +2119,7 @@ fn display_result<Writer: std::io::Write>(
 }
 
 fn main() {
+    hooks::arm_early(); // BCLL fork: no-op unless MEMTEST_VULKAN_HARD_DEADLINE_S is set
     #[cfg(feature = "diagnostics")]
     if let Some(code) = bcll::run_if_requested() {
         std::process::exit(code);

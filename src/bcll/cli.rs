@@ -202,6 +202,30 @@ pub fn parse_size(v: &str) -> Result<u64, String> {
     Ok((n * mul as f64) as u64)
 }
 
+/// The `--report-json` destination of a command line that failed to parse, so the refusal
+/// can still replace a stale output there (BLOCK 5497b81c #4). Never for worker invocations.
+pub fn report_path_of(args: &[String]) -> Option<PathBuf> {
+    if args
+        .iter()
+        .any(|a| a == "--bcll-worker" || a.starts_with("--bcll-worker="))
+    {
+        return None;
+    }
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--report-json" {
+            return it
+                .next()
+                .filter(|v| !v.starts_with("--"))
+                .map(PathBuf::from);
+        }
+        if let Some(v) = a.strip_prefix("--report-json=") {
+            return (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+    }
+    None
+}
+
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut o = Options::default();
     let mut explicit_command: Option<Command> = None;
@@ -416,6 +440,23 @@ mod tests {
         assert!(parse(&args("--gpu 0 --memtest")).is_err());
         assert!(parse(&args("--gpu 0 --telemetry-ms 5")).is_err());
         assert!(parse(&args("--info")).is_err());
+    }
+
+    #[test]
+    fn report_path_survives_parse_errors() {
+        assert_eq!(
+            report_path_of(&args("--report-json r.json --memtest 10")),
+            Some(PathBuf::from("r.json"))
+        );
+        assert_eq!(
+            report_path_of(&args("--memtest=0 --report-json=x/r.json")),
+            Some(PathBuf::from("x/r.json"))
+        );
+        assert_eq!(report_path_of(&args("--report-json --memtest 10")), None);
+        assert_eq!(
+            report_path_of(&args("--bcll-worker compute --report-json r.json")),
+            None
+        );
     }
 
     #[test]

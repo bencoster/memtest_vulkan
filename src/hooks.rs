@@ -124,6 +124,12 @@ pub fn identity_verdict(
     Ok(())
 }
 
+/// Arms the hard-deadline watchdog (if requested). Called FIRST in `main()`, before the
+/// Vulkan loader or any enumeration, so a stall there is still bounded (BLOCK 5497b81c #1).
+pub fn arm_early() {
+    let _ = state();
+}
+
 /// Called by upstream's selection code before any device is created. Returns false (after
 /// emitting `memtest_identity_mismatch`) when the selected device is not the approved one.
 pub fn identity_ok(pci: (u32, u32, u32, u32), uuid: Option<[u8; 16]>) -> bool {

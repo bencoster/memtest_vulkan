@@ -225,7 +225,7 @@ Current rig map:
 
 | OS | Availability |
 |---|---|
-| Windows | `nvapi` feature. Uses the undocumented `NvAPI_GPU_ThermalGetSensors` (HWiNFO / GPU-Z / LibreHardwareMonitor use the same). It is marked `nvapi_undocumented` in the output and disables itself on any error. Verified on this rig: 3090 channel 9 and 4090 channel 7 read plausible idle values. `--no-nvapi` turns it off. |
+| Windows | `nvapi` feature. Like `nvml.dll` and `nvcuda.dll`, it is loaded only from `%SystemRoot%\System32` by absolute path; there is never a search-path fallback, so a missing driver DLL fails instead of loading a planted copy. Uses the undocumented `NvAPI_GPU_ThermalGetSensors` (HWiNFO / GPU-Z / LibreHardwareMonitor use the same). It is marked `nvapi_undocumented` in the output and disables itself on any error. Verified on this rig: 3090 channel 9 and 4090 channel 7 read plausible idle values. `--no-nvapi` turns it off. |
 | Linux | No supported userspace API: NVML's memory temperature field is datacenter-only. The community tool `gddr6` reads it through BAR0 MMIO as root. That approach is deliberately out of scope here (raw MMIO / kernel access, security). Use the GPU core temperature + throttle reasons as the proxy, or check on Windows. |
 
 ## 7. Maintenance

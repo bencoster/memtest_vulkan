@@ -79,7 +79,7 @@ macro_rules! cuda_api {
                 // SAFETY: loading the NVIDIA driver library; symbols are resolved by name and type
                 // matches cuda.h (CUDAAPI = __stdcall on 32-bit Windows, C ABI on x64/Linux).
                 unsafe {
-                    let lib = libloading::Library::new(crate::bcll::system_library(LIB_NAME))
+                    let lib = libloading::Library::new(crate::bcll::system_library(LIB_NAME)?)
                         .map_err(|e| format!("{LIB_NAME} not loadable (no NVIDIA driver?): {e}"))?;
                     $(
                         let $name = *lib

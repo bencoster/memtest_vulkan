@@ -263,3 +263,12 @@ Verification limits:
 - Linux was type-checked (`cargo check --target x86_64-unknown-linux-gnu --all-targets`, `-D warnings`)
   but not linked or run: there is no Linux linker on this host.
 - No GPU workload was run. The barrier and identity paths need the documented live run.
+
+## 12. Codex re-review: BLOCK 5497b81c (at 1b16a33) and its resolution
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 (P1) | Containment failed open: child spawned before Job assignment, setup errors ignored; ffmpeg had no self-deadline; upstream child armed its deadline only after Vulkan enumeration; Linux ignored `prctl` failure and the parent-death race | The supervisor joins a kill-on-close job ITSELF before any child (membership verified with `IsProcessInJob`), so children are members from creation (ffmpeg included). Setup failure is stored and every spawn refuses. Linux: a `prctl` failure aborts the spawn; a `getppid` mismatch exits the child. `hooks::arm_early()` is the first statement of `main()`. Tests (real processes, CPU only): supervisor-exits-child-dies (mutation-checked: fails with containment disabled); init stall hits the hard deadline (exit SIGNATURE\|RUNTIME_ABORT); setup failure refuses to spawn. |
+| 2 (P2) | Library loading fell back to a bare name | `system_library` returns `%SystemRoot%\System32\<dll>` as an absolute path even when absent (the load then fails), and an error when SystemRoot is unset or relative. No bare-name fallback on Windows. Tests cover the absent-root, missing-file and relative-root branches without loading a driver. |
+| 3 (P2) | `--gpu 4294967296` wrapped to NVML index 0 | `Spec::Index(u32)` is parsed checked, so out-of-range values are refused. Tests: 2^32, 2^32+1 and `index:` forms refused; u32::MAX parses but selects nothing. |
+| 4 (P2) | A parse-time refusal left the previous output intact | A parse error with a named `--report-json` (never for worker invocations) deletes the old file and writes a refusal record (verdict null, `refusal: "invalid command line: …"`), then exits 3, or 4 if that cannot be written. `abort` deletes any stale file before writing. Test: a stale PASS replaced for missing `--gpu` and for an invalid duration. |

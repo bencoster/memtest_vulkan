@@ -235,70 +235,106 @@ pub fn arm_self_deadline(seconds: Option<f64>, code: i32, events: &std::path::Pa
         });
 }
 
-/// Spawns with parent-death containment (see module docs).
-pub fn spawn_contained(mut cmd: Command) -> Result<Child, String> {
+/// Process-wide containment, established ONCE before the supervisor starts any child
+/// (Codex BLOCK 5497b81c #1). Windows: the supervisor puts ITSELF into a kill-on-close Job
+/// Object, so every later child (workers, ffmpeg, their descendants) is a member from the
+/// instant it is created - there is no spawn-then-assign window - and dies when the
+/// supervisor exits for any reason. Linux: per-child PR_SET_PDEATHSIG (see spawn). A setup
+/// failure is remembered and makes every spawn fail closed.
+pub fn ensure_contained() -> Result<(), String> {
+    static STATE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    STATE.get_or_init(platform_contain).clone()
+}
+
+#[cfg(windows)]
+fn platform_contain() -> Result<(), String> {
+    windows_job::contain_self()
+}
+
+#[cfg(not(windows))]
+fn platform_contain() -> Result<(), String> {
+    Ok(()) // per-child PDEATHSIG on Linux; no mechanism on other unixes (documented)
+}
+
+/// Spawns a child only if containment is in force (fail closed).
+pub fn spawn_contained(cmd: Command) -> Result<Child, String> {
+    spawn_with(cmd, &ensure_contained())
+}
+
+/// `spawn_contained` with the containment state injected (unit-testable).
+pub fn spawn_with(mut cmd: Command, containment: &Result<(), String>) -> Result<Child, String> {
+    if let Err(e) = containment {
+        return Err(format!(
+            "refusing to start a child without parent-death containment: {e}"
+        ));
+    }
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: prctl is async-signal-safe; nothing else runs between fork and exec here.
+        let parent = std::process::id() as nix::libc::pid_t;
+        // SAFETY: only async-signal-safe libc calls between fork and exec.
         unsafe {
-            cmd.pre_exec(|| {
-                nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL);
+            cmd.pre_exec(move || {
+                if nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error()); // spawn fails: fail closed
+                }
+                // the supervisor died between fork and prctl: the signal will never come
+                if nix::libc::getppid() != parent {
+                    nix::libc::_exit(1);
+                }
                 Ok(())
             });
         }
     }
-    let child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-    #[cfg(windows)]
-    windows_job::assign(&child);
-    Ok(child)
+    cmd.spawn().map_err(|e| format!("spawn failed: {e}"))
 }
 
 #[cfg(windows)]
 mod windows_job {
-    use std::os::windows::io::AsRawHandle;
-    use std::sync::OnceLock;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    struct Job(isize);
-    // SAFETY: a job handle is a process-wide kernel handle, usable from any thread.
-    unsafe impl Send for Job {}
-    unsafe impl Sync for Job {}
-
-    /// One kill-on-close job per supervisor process; the handle is never closed explicitly,
-    /// so the OS closes it at process exit and kills every still-running member.
-    fn job() -> Option<&'static Job> {
-        static JOB: OnceLock<Option<Job>> = OnceLock::new();
-        JOB.get_or_init(|| unsafe {
+    /// Creates the job and joins it; the handle is deliberately leaked so it closes only at
+    /// process exit, which is exactly when the kill-on-close must fire.
+    pub fn contain_self() -> Result<(), String> {
+        // SAFETY: plain Win32 calls with valid arguments; the job handle lives until exit.
+        unsafe {
             let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if h.is_null() {
-                return None;
+                return Err(format!(
+                    "CreateJobObjectW failed: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let ok = SetInformationJobObject(
+            if SetInformationJobObject(
                 h,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const core::ffi::c_void,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            (ok != 0).then_some(Job(h as isize))
-        })
-        .as_ref()
-    }
-
-    pub fn assign(child: &std::process::Child) {
-        if let Some(j) = job() {
-            // SAFETY: both handles are valid for the duration of the call. Failure (e.g. the
-            // supervisor itself runs in a job that forbids nesting) only loses containment;
-            // the worker's own hard deadline still applies.
-            unsafe {
-                AssignProcessToJobObject(j.0 as _, child.as_raw_handle() as _);
+            ) == 0
+            {
+                return Err(format!(
+                    "SetInformationJobObject failed: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
+            if AssignProcessToJobObject(h, GetCurrentProcess()) == 0 {
+                return Err(format!(
+                    "AssignProcessToJobObject(self) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut inside = 0;
+            if IsProcessInJob(GetCurrentProcess(), h, &mut inside) == 0 || inside == 0 {
+                return Err("process is not in its kill-on-close job after assignment".into());
+            }
+            Ok(())
         }
     }
 }
@@ -467,6 +503,143 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
         assert!(o.dead_confirmed && !o.pipes_complete, "{o:?}");
         assert!(o.stdout.contains("started"));
+    }
+
+    #[test]
+    fn containment_setup_failure_refuses_to_spawn() {
+        let err: Result<(), String> = Err("AssignProcessToJobObject(self) failed".into());
+        let r = spawn_with(sleeper(30), &err);
+        assert!(r.unwrap_err().contains("without parent-death containment"));
+        assert!(spawn_with(sleeper(0), &Ok(())).unwrap().wait().is_ok());
+    }
+
+    /// Runs one #[ignore]d helper test of this binary as a separate process.
+    fn run_helper(name: &str, envs: &[(&str, String)], limit: Duration) -> (Option<i32>, Duration) {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--ignored",
+            "--exact",
+            name,
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ]);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let t = Instant::now();
+        let o = run(
+            cmd,
+            &Limits {
+                timeout: limit,
+                ..Limits::new(limit)
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        (o.exit_code, t.elapsed())
+    }
+
+    fn alive_after(pid: u32, wait: Duration) -> bool {
+        let t = Instant::now();
+        while t.elapsed() < wait {
+            if !pid_alive(pid) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        pid_alive(pid)
+    }
+
+    #[cfg(windows)]
+    fn pid_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+        unsafe {
+            let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let r = WaitForSingleObject(h, 0);
+            CloseHandle(h);
+            r == WAIT_TIMEOUT
+        }
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        // a zombie is dead for our purpose; /proc state Z
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        !stat.is_empty() && !stat.contains(") Z ")
+    }
+
+    /// The supervisor dies abruptly right after starting a long child: the child must die too.
+    #[test]
+    fn child_dies_when_the_supervisor_exits() {
+        let pidfile = std::env::temp_dir().join(format!("bcll-contain-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let (code, _) = run_helper(
+            "bcll::proc::tests::helper_supervisor_exits",
+            &[(
+                "BCLL_HELPER_PIDFILE",
+                pidfile.to_string_lossy().into_owned(),
+            )],
+            Duration::from_secs(60),
+        );
+        assert_eq!(code, Some(0));
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(
+            !alive_after(pid, Duration::from_secs(10)),
+            "child {pid} survived its supervisor"
+        );
+    }
+
+    #[test]
+    #[ignore = "helper process for child_dies_when_the_supervisor_exits"]
+    fn helper_supervisor_exits() {
+        let Ok(pidfile) = std::env::var("BCLL_HELPER_PIDFILE") else {
+            return;
+        };
+        ensure_contained().unwrap();
+        let child = spawn_contained(sleeper(120)).unwrap();
+        std::fs::write(&pidfile, child.id().to_string()).unwrap();
+        std::process::exit(0); // no cleanup, no kill: only containment can stop the child
+    }
+
+    /// An upstream memtest child stuck before its first hook (e.g. in Vulkan enumeration)
+    /// must still end at MEMTEST_VULKAN_HARD_DEADLINE_S, armed first thing in main().
+    #[test]
+    fn upstream_child_stalled_in_init_hits_its_hard_deadline() {
+        let (code, elapsed) = run_helper(
+            "bcll::proc::tests::helper_init_stall",
+            &[
+                (crate::hooks::ENV_HARD_DEADLINE_S, "1".into()),
+                ("BCLL_HELPER_STALL", "1".into()),
+            ],
+            Duration::from_secs(60),
+        );
+        let abort =
+            (crate::close::app_status::SIGNATURE | crate::close::app_status::RUNTIME_ABORT) as i32;
+        assert_eq!(code, Some(abort));
+        assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+    }
+
+    #[test]
+    #[ignore = "helper process for upstream_child_stalled_in_init_hits_its_hard_deadline"]
+    fn helper_init_stall() {
+        if std::env::var("BCLL_HELPER_STALL").is_err() {
+            return;
+        }
+        crate::hooks::arm_early(); // what main() does before anything else
+        std::thread::sleep(Duration::from_secs(120)); // stands in for a stuck driver call
     }
 
     #[test]

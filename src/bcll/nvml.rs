@@ -86,7 +86,8 @@ impl NvmlCtx {
             "nvml.dll"
         } else {
             "libnvidia-ml.so.1"
-        });
+        })
+        .map_err(|e| format!("NVML unavailable: {e}"))?;
         Nvml::builder()
             .lib_path(std::ffi::OsStr::new(&lib))
             .init()

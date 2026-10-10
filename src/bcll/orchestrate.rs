@@ -17,10 +17,7 @@ use std::time::Instant;
 pub fn main(args: Vec<String>) -> i32 {
     let opts = match cli::parse(&args) {
         Ok(o) => o,
-        Err(e) => {
-            eprintln!("memtest_vulkan: {e}");
-            return report::EXIT_REFUSED;
-        }
+        Err(e) => return refuse_unparsed(&args, &e),
     };
     match &opts.command {
         Command::Help => {
@@ -62,6 +59,38 @@ fn cuda_worker(w: &cli::WorkerArgs) -> i32 {
     report::EXIT_INTERNAL
 }
 
+/// A command line that did not parse is still a refusal of the run: if it named an
+/// output file, replace whatever is there with a refusal record so an old PASS can never
+/// be read as this invocation's result (BLOCK 5497b81c #4).
+fn refuse_unparsed(args: &[String], err: &str) -> i32 {
+    eprintln!("memtest_vulkan: {err}");
+    let Some(path) = cli::report_path_of(args) else {
+        return report::EXIT_REFUSED;
+    };
+    let opts = Options {
+        report_json: Some(path),
+        ..Default::default()
+    };
+    let mut rep = Report::new(
+        tool_info(),
+        RunInfo {
+            started_at: crate::output::NowTime.to_string(),
+            os: std::env::consts::OS.into(),
+            hostname: hostname(),
+            command_line: std::iter::once("memtest_vulkan".to_string())
+                .chain(args.iter().cloned())
+                .collect(),
+            ..Default::default()
+        },
+    );
+    abort(
+        &mut rep,
+        &opts,
+        Instant::now(),
+        Abort::Refused(format!("invalid command line: {err}")),
+    )
+}
+
 enum Abort {
     Refused(String),
     Error(String),
@@ -70,6 +99,16 @@ enum Abort {
 /// Ends a run that never reached testing: the reason goes into the output (if requested)
 /// so a consumer never mistakes silence for a result (BLOCK 89de0c26 #8).
 fn abort(rep: &mut Report, opts: &Options, started: Instant, why: Abort) -> i32 {
+    if let Some(p) = &opts.report_json
+        && p.exists()
+        && std::fs::remove_file(p).is_err()
+    {
+        eprintln!(
+            "memtest_vulkan: cannot remove previous output {}",
+            p.display()
+        );
+        return report::EXIT_INTERNAL;
+    }
     let code = match why {
         Abort::Refused(m) => {
             eprintln!("memtest_vulkan: REFUSED: {m}");
@@ -690,6 +729,52 @@ mod tests {
             Abort::Refused("display".into()),
         );
         assert_eq!(code, report::EXIT_INTERNAL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_refusal_replaces_a_stale_pass() {
+        let dir = std::env::temp_dir().join(format!("bcll-parse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.json");
+        std::fs::write(
+            &path,
+            r#"{"schema":"bcll.gpu_diag.report","verdict":"PASS"}"#,
+        )
+        .unwrap();
+        let p = path.to_string_lossy().into_owned();
+        // missing --gpu, then an invalid duration: both are parse-time refusals
+        for argv in [
+            vec![
+                "--report-json".to_string(),
+                p.clone(),
+                "--memtest".into(),
+                "10".into(),
+            ],
+            vec![
+                "--gpu".into(),
+                "3".into(),
+                "--memtest".into(),
+                "-5".into(),
+                format!("--report-json={p}"),
+            ],
+        ] {
+            std::fs::write(&path, r#"{"verdict":"PASS"}"#).unwrap();
+            assert_eq!(main(argv), report::EXIT_REFUSED);
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(v["verdict"].is_null(), "stale PASS survived: {v}");
+            assert!(
+                v["refusal"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid command line")
+            );
+        }
+        // no output named: plain refusal, nothing written
+        assert_eq!(
+            main(vec!["--memtest".into(), "10".into()]),
+            report::EXIT_REFUSED
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

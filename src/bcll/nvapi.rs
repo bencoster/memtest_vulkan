@@ -145,7 +145,7 @@ mod imp {
         ) -> Result<Reader, String> {
             // SAFETY: loading the NVIDIA-shipped system DLL; all symbols are checked for null.
             unsafe {
-                let lib = libloading::Library::new(crate::bcll::system_library("nvapi64.dll"))
+                let lib = libloading::Library::new(crate::bcll::system_library("nvapi64.dll")?)
                     .map_err(|e| format!("nvapi64.dll not loadable: {e}"))?;
                 let qi: QueryInterface = *lib
                     .get::<QueryInterface>(b"nvapi_QueryInterface\0")
