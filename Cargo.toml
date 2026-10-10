@@ -12,9 +12,23 @@ byte-strings = '0.3.1'
 mortal = { git = 'https://github.com/GpuZelenograd/mortal.git', tag = '2025-windows-sys-migration' }
 chrono = '0.4.42'
 hhmmss = '0.1.0'
+serde = { version = '1.0', features = ['derive'], optional = true }
+serde_json = { version = '1.0', optional = true }
+nvml-wrapper = { version = '0.13', optional = true }
 
 [features]
+# BCLL fork: `diagnostics` adds the long-flag CLI (card selection, JSON report,
+# telemetry, compute/transfer/codec tests). `nvml` adds NVIDIA card details and
+# telemetry (NVML is dynamically loaded; absent driver = feature reports "unavailable").
+# `nvapi` adds the Windows-only undocumented memory-junction temperature read.
+# `cuda` adds the CUDA driver-API (VMM) memory test (nvcuda dynamically loaded).
+# `cargo build --no-default-features` gives the pure upstream program.
+default = ['diagnostics', 'nvml', 'nvapi', 'cuda']
 verbose = []
+diagnostics = ['dep:serde', 'dep:serde_json']
+nvml = ['diagnostics', 'dep:nvml-wrapper']
+nvapi = ['diagnostics']
+cuda = ['diagnostics']
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 default-features = false

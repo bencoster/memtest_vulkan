@@ -1,5 +1,8 @@
+#[cfg(feature = "diagnostics")]
+mod bcll;
 mod close;
 mod erupt_vendored_utils_loading;
+mod hooks;
 mod input;
 mod output;
 mod ram;
@@ -485,6 +488,7 @@ impl<T> MapErrRetryWithLowerMemory for erupt::utils::VulkanResult<T> {
                 if env.verbose() {
                     println!("Retrying with lower memory due to {}", msg);
                 }
+                hooks::init_failure(&msg);
                 //immediate exit in non-interactive during init to initiate try with lower memory
                 close::immediate_exit(true);
             }
@@ -902,6 +906,19 @@ fn test_device<Writer: std::io::Write>(
                                         device
                                             .begin_command_buffer(cmd_buf, &vk::CommandBufferBeginInfo::default())
                                             .err_retry_with_lower_memory(env, "begin_command_buffer")?;
+                                        // BCLL fork (Codex audit F1): fence completion alone does not make shader
+                                        // writes visible to the next dispatch or to the host; declare both dependencies.
+                                        device.cmd_pipeline_barrier(
+                                            cmd_buf,
+                                            vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
+                                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                                            vk::DependencyFlags::empty(),
+                                            &[vk::MemoryBarrierBuilder::new()
+                                                .src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::SHADER_WRITE)
+                                                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)],
+                                            &[],
+                                            &[],
+                                        );
                                         device.cmd_bind_pipeline(cmd_buf, vk::PipelineBindPoint::COMPUTE, pipeline);
                                         device.cmd_bind_descriptor_sets(
                                             cmd_buf,
@@ -916,6 +933,17 @@ fn test_device<Writer: std::io::Write>(
                                             (TEST_WINDOW_1D_MAX_GROUPS / WG_SIZE) as u32,
                                             test_element_count / VEC_SIZE as u32 / TEST_WINDOW_1D_MAX_GROUPS as u32,
                                             1,
+                                        );
+                                        device.cmd_pipeline_barrier(
+                                            cmd_buf,
+                                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                                            vk::PipelineStageFlags::HOST,
+                                            vk::DependencyFlags::empty(),
+                                            &[vk::MemoryBarrierBuilder::new()
+                                                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                                                .dst_access_mask(vk::AccessFlags::HOST_READ)],
+                                            &[],
+                                            &[],
                                         );
                                         device.end_command_buffer(cmd_buf).err_retry_with_lower_memory(env, "end_command_buffer")?;
                                         device
@@ -943,6 +971,36 @@ fn test_device<Writer: std::io::Write>(
                                         overall_exec_result = Err(e);
                                         break 'window;
                                     }
+                                    // BCLL fork (Codex audit F2): upstream ignored mismatches seen while
+                                    // verifying the initial fill; report and latch them as runtime errors.
+                                    let init_out: IOBuf = unsafe { std::ptr::read(mapped) };
+                                    if let Some((error_range, total_errors)) =
+                                        init_out.get_error_addresses_and_count(test_offset)
+                                    {
+                                        close::raise_status_bit(close::app_status::RUNTIME_ERRORS);
+                                        let _ = writeln!(
+                                            log_dupler,
+                                            "Error found. Mode INITIAL_FILL, total errors 0x{:X}\nErrors address range: {:?}  iteration:{}\n{}",
+                                            total_errors, error_range, init_out.iter, init_out
+                                        );
+                                        hooks::memtest_error(&hooks::ErrorReport {
+                                            iteration: init_out.iter,
+                                            mode: "INITIAL_FILL",
+                                            window_offset: test_offset,
+                                            window_bytes: test_window_size,
+                                            idx_min: init_out.idx_min,
+                                            idx_max: init_out.idx_max,
+                                            single_bit_idx: &init_out.err_bit1_idx.0,
+                                            toggle_count: &init_out.err_bitcount.0,
+                                            ones_in_value: &init_out.mem_bitcount.0,
+                                            actual_ff: init_out.actual_ff,
+                                            actual_min: init_out.actual_min,
+                                            actual_max: init_out.actual_max,
+                                        });
+                                    }
+                                    unsafe {
+                                        std::ptr::write(mapped, IOBuf::for_initial_iteration())
+                                    }
                                 }
                                 match overall_exec_result {
                                     Err(e) => last_err = e,
@@ -963,6 +1021,7 @@ fn test_device<Writer: std::io::Write>(
             );
         }
         if !env.interactive {
+            hooks::init_failure(&last_err.to_string());
             close::immediate_exit(true);
         }
         if warn_on_budget_alloc_fail {
@@ -1023,6 +1082,8 @@ fn test_device<Writer: std::io::Write>(
             test_mem_reqs.memory_type_bits
         );
     }
+
+    hooks::memtest_started(allocation_size, test_window_size, test_window_count);
 
     // allow write bugs emulation for testing purposes
     let emulate_write_bugs_iteration = env::var("MEMTEST_VULKAN_EMULATE_WRITE_BUG_ITERATION")
@@ -1105,6 +1166,24 @@ fn test_device<Writer: std::io::Write>(
                         "  iteration:{}\n{}",
                         last_buffer_out.iter, last_buffer_out
                     )?;
+                    hooks::memtest_error(&hooks::ErrorReport {
+                        iteration: last_buffer_out.iter,
+                        mode: if reread_mode_for_this_win {
+                            "NEXT_RE_READ"
+                        } else {
+                            "INITIAL_READ"
+                        },
+                        window_offset: test_offset,
+                        window_bytes: test_window_size,
+                        idx_min: last_buffer_out.idx_min,
+                        idx_max: last_buffer_out.idx_max,
+                        single_bit_idx: &last_buffer_out.err_bit1_idx.0,
+                        toggle_count: &last_buffer_out.err_bitcount.0,
+                        ones_in_value: &last_buffer_out.mem_bitcount.0,
+                        actual_ff: last_buffer_out.actual_ff,
+                        actual_min: last_buffer_out.actual_min,
+                        actual_max: last_buffer_out.actual_max,
+                    });
                 }
                 last_buffer_out.check_vec_first()?;
             }
@@ -1112,7 +1191,8 @@ fn test_device<Writer: std::io::Write>(
         read_bytes += test_window_size * test_window_count;
         let moment_iter_ends = time::Instant::now();
         let elapsed = moment_iter_ends - last_status_output;
-        let stop_testing = close::close_requested();
+        let deadline_reached = hooks::deadline_reached();
+        let stop_testing = close::close_requested() || deadline_reached;
         if elapsed > next_report_duration || stop_testing {
             let write_secs = write_duration.as_secs_f32();
             let passed_secs = elapsed.as_secs_f32() - write_secs;
@@ -1126,6 +1206,13 @@ fn test_device<Writer: std::io::Write>(
             } else {
                 0f32
             };
+            hooks::memtest_progress(
+                iteration as u64,
+                written_bytes,
+                read_bytes,
+                write_speed_gbps,
+                check_speed_gbps,
+            );
             let second1 = time::Duration::from_secs(1);
             if next_report_duration.is_zero() {
                 writeln!(log_dupler, "Standard 5-minute test of {}", selected_label)?;
@@ -1181,7 +1268,16 @@ fn test_device<Writer: std::io::Write>(
             last_status_output = time::Instant::now();
         }
         if stop_testing {
-            let _ = writeln!(log_dupler, "received user interruption, testing stopped");
+            if deadline_reached {
+                let _ = writeln!(
+                    log_dupler,
+                    "requested test duration reached, testing stopped"
+                );
+                hooks::memtest_finished(iteration as u64, "duration_reached");
+            } else {
+                let _ = writeln!(log_dupler, "received user interruption, testing stopped");
+                hooks::memtest_finished(iteration as u64, "interrupted");
+            }
             break;
         }
         buffer_in.prepare_next_iter_write();
@@ -1210,6 +1306,19 @@ struct NamedComputeDevice {
     memory_props: vk::PhysicalDeviceMemoryProperties,
     budget_props: ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXT,
     index_in_device_iteration: usize,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pci: PciAddress,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    device_uuid: Option<[u8; 16]>,
+}
+
+/// PCI location from VK_EXT_pci_bus_info (all zero when the driver lacks the extension).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PciAddress {
+    pub domain: u32,
+    pub bus: u32,
+    pub device: u32,
+    pub function: u32,
 }
 
 fn load_instance<Writer: std::io::Write>(
@@ -1351,6 +1460,10 @@ fn load_instance<Writer: std::io::Write>(
         }
     }
 }
+/// BCLL fork: set by the diagnostics CLI so machine-readable stdout stays clean.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+static QUIET_INSTANCE_DROP: AtomicBool = AtomicBool::new(false);
+
 struct LoadedDevices {
     // use Option to enforce InstanceLoader must be dropped before EntryLoader inside Drop implementation;
     // outside Drop theay are always Some
@@ -1381,7 +1494,9 @@ impl LoadedDevices {
 impl Drop for LoadedDevices {
     fn drop(&mut self) {
         unsafe {
-            println!("Destroying vk instance...");
+            if !QUIET_INSTANCE_DROP.load(SeqCst) {
+                println!("Destroying vk instance...");
+            }
             if !self.messenger.is_null() {
                 self.instance()
                     .destroy_debug_utils_messenger_ext(self.messenger, None);
@@ -1428,12 +1543,14 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
 
             let mut budget_request =
                 ext_memory_budget::PhysicalDeviceMemoryBudgetPropertiesEXTBuilder::new();
+            let mut id_request = vk::PhysicalDeviceIDPropertiesBuilder::new();
 
             //older vulkan implementations like broadcom on RaspberryPi lacks vk_1_1 support even if application requested it
 
             let memory_props = if effective_version >= (1, 1) {
                 let mut device_props2 = vk::PhysicalDeviceProperties2Builder::new()
-                    .extend_from(&mut pci_structure_request);
+                    .extend_from(&mut pci_structure_request)
+                    .extend_from(&mut id_request);
 
                 instance.get_physical_device_properties2(physical_device, &mut device_props2);
                 properties = device_props2.properties;
@@ -1447,6 +1564,7 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
             };
             let pci_props_structure = *pci_structure_request;
             let budget_props = *budget_request;
+            let device_uuid = (effective_version >= (1, 1)).then_some(id_request.device_uuid);
 
             Some((
                 physical_device,
@@ -1456,10 +1574,11 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
                 memory_props,
                 budget_props,
                 index_in_device_iteration,
+                device_uuid,
             ))
         })
         .collect();
-    compute_capable_devices.sort_by_key(|(_, _, props, pci_props, _, _, _)| {
+    compute_capable_devices.sort_by_key(|(_, _, props, pci_props, _, _, _, _)| {
         // assuming that for multi-GPU scenarious the minimal PCIe bus number is used for picture output
         // and the maximal is the test target select by default "the descrete GPU with maximal PCIe bus number"
         match props.device_type {
@@ -1519,6 +1638,13 @@ fn list_devices_ordered_labaled_from_1<Writer: std::io::Write>(
             memory_props,
             budget_props: d.5,
             index_in_device_iteration: d.6,
+            pci: PciAddress {
+                domain: pci_props.pci_domain,
+                bus: pci_props.pci_bus,
+                device: pci_props.pci_device,
+                function: pci_props.pci_function,
+            },
+            device_uuid: d.7,
         });
     }
     Ok(LoadedDevices::new(
@@ -1982,6 +2108,10 @@ fn display_result<Writer: std::io::Write>(
 }
 
 fn main() {
+    #[cfg(feature = "diagnostics")]
+    if let Some(code) = bcll::run_if_requested() {
+        std::process::exit(code);
+    }
     let env = init_running_env();
     if !env.interactive {
         close::setup_handler(false);

@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bcll.gpu_diag.report/v1",
+  "title": "BCLL GPU diagnostics report v1",
+  "description": "Written by memtest_vulkan --report-json (implementation 'rust') and BC_LocalLLM gpu.vram_test (implementation 'python'). Within v1 fields are only ADDED, never renamed or removed. See SCHEMA.md.",
+  "type": "object",
+  "required": ["schema", "schema_version", "tool", "run", "device", "tests", "verdict", "reasons", "warnings"],
+  "properties": {
+    "schema": { "const": "bcll.gpu_diag.report" },
+    "schema_version": { "const": 1 },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version", "implementation", "features"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "implementation": { "enum": ["rust", "python"] },
+        "features": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "run": {
+      "type": "object",
+      "required": ["started_at", "os", "command_line"],
+      "properties": {
+        "started_at": { "type": "string", "description": "RFC 3339 UTC" },
+        "finished_at": { "type": ["string", "null"] },
+        "duration_s": { "type": ["number", "null"] },
+        "os": { "type": "string" },
+        "hostname": { "type": ["string", "null"] },
+        "command_line": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "device": {
+      "type": ["object", "null"],
+      "required": ["index_pci_order", "pci_bus_id", "uuid", "name", "display_attached", "details"],
+      "properties": {
+        "selector": { "type": ["string", "null"] },
+        "index_pci_order": { "type": "integer", "minimum": 0 },
+        "vk_label": { "type": "integer" },
+        "pci_bus_id": { "type": "string", "pattern": "^[0-9a-f]{4,8}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$" },
+        "uuid": { "type": ["string", "null"] },
+        "name": { "type": "string" },
+        "vendor_id": { "type": "integer" },
+        "device_id": { "type": "integer" },
+        "vulkan_driver_version": { "type": "integer" },
+        "vulkan_api_version": { "type": "string" },
+        "device_local_bytes": { "type": "integer" },
+        "display_attached": { "type": ["boolean", "null"] },
+        "details": { "type": ["object", "null"], "description": "NVML card details; see SCHEMA.md" }
+      }
+    },
+    "health_before": { "$ref": "#/$defs/health" },
+    "health_after": { "$ref": "#/$defs/health" },
+    "health_delta": { "type": ["object", "null"], "additionalProperties": { "type": "integer" } },
+    "tests": { "type": "array", "items": { "$ref": "#/$defs/test" } },
+    "telemetry": { "type": ["object", "null"] },
+    "verdict": { "enum": ["PASS", "FAIL", "INCOMPLETE", null] },
+    "reasons": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "health": {
+      "type": ["object", "null"],
+      "properties": {
+        "taken_at": { "type": "string" },
+        "ecc_mode_current": { "type": ["boolean", "null"] },
+        "ecc_volatile_corrected": { "type": ["integer", "null"] },
+        "ecc_volatile_uncorrected": { "type": ["integer", "null"] },
+        "ecc_aggregate_corrected": { "type": ["integer", "null"] },
+        "ecc_aggregate_uncorrected": { "type": ["integer", "null"] },
+        "remapped_rows_correctable": { "type": ["integer", "null"] },
+        "remapped_rows_uncorrectable": { "type": ["integer", "null"] },
+        "remap_pending": { "type": ["boolean", "null"] },
+        "remap_failure": { "type": ["boolean", "null"] },
+        "remap_histogram": { "type": ["object", "null"] },
+        "pcie_counters": { "type": "object", "additionalProperties": { "type": ["integer", "null"] } },
+        "aer": { "type": ["object", "null"] }
+      }
+    },
+    "test": {
+      "type": "object",
+      "required": ["kind", "engine", "name", "status", "error_count", "errors", "errors_truncated", "metrics"],
+      "properties": {
+        "kind": { "enum": ["vram", "compute", "pcie_transfer", "codec"] },
+        "engine": { "enum": ["vulkan", "cuda", "ffmpeg", "torch"] },
+        "name": { "type": "string" },
+        "status": { "enum": ["pass", "fail", "incomplete", "error", "unsupported", "skipped"] },
+        "started_at": { "type": ["string", "null"] },
+        "duration_s": { "type": ["number", "null"] },
+        "coverage": {
+          "type": ["object", "null"],
+          "required": ["tested_bytes"],
+          "properties": {
+            "tested_bytes": { "type": "integer" },
+            "total_bytes": { "type": ["integer", "null"] },
+            "free_bytes_at_start": { "type": ["integer", "null"] },
+            "reserved_or_used_bytes": { "type": ["integer", "null"] },
+            "driver_reserved_bytes": { "type": ["integer", "null"] }
+          }
+        },
+        "error_count": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/error" } },
+        "errors_truncated": { "type": "boolean" },
+        "metrics": { "type": "object" },
+        "message": { "type": ["string", "null"] },
+        "termination": { "enum": ["completed", "mismatch", "runtime_error", "device_lost", "timed_out", "crashed", "init_failed", "cancelled", "unsupported", null] }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["count"],
+      "properties": {
+        "offset_bytes": { "type": ["integer", "null"], "description": "offset in the tested allocation (virtual)" },
+        "offset_range": { "type": ["array", "null"], "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+        "expected": { "type": ["integer", "null"] },
+        "actual": { "type": ["integer", "null"] },
+        "xor_mask": { "type": ["integer", "null"] },
+        "count": { "type": "integer", "minimum": 0 },
+        "iteration": { "type": ["integer", "null"] },
+        "detail": { "type": ["object", "null"] }
+      }
+    }
+  }
+}
