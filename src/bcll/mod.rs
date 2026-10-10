@@ -7,6 +7,8 @@ pub mod codec;
 pub mod compute_ref;
 pub mod cuda;
 pub mod events;
+pub mod inventory;
+pub mod judge;
 pub mod nvapi;
 #[cfg(feature = "nvml")]
 #[path = "nvml.rs"]
@@ -16,10 +18,12 @@ pub mod nvml;
 pub mod nvml;
 pub mod orchestrate;
 pub mod report;
+pub mod runners;
 pub mod select;
 pub mod shaders;
 pub mod telemetry;
 pub mod vk_diag;
+pub mod vk_gpu;
 
 /// Entry point from `main()`: handles long-flag invocations, returns the exit
 /// code; `None` means "not ours" (upstream positional/interactive flow).

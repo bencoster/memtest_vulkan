@@ -40,6 +40,32 @@ and USAGE.md for commands. The report format is in SCHEMA.md and `report.schema.
      `VkPhysicalDeviceIDProperties`), filled in the existing properties2 chain.
   6. `Cargo.toml`: features and optional dependencies.
 
+**Module map** (`src/bcll/`):
+
+| Module | Role |
+|---|---|
+| `mod.rs` | entry |
+| `cli.rs` | long-flag CLI |
+| `inventory.rs` | GPUs + numbering |
+| `select.rs` | `--gpu` specs |
+| `orchestrate.rs` | run flow, safety gate, telemetry wiring, output |
+| `runners.rs` | spawn workers with deadlines |
+| `judge.rs` | pure exit-code/event → result rules |
+| `report.rs` | schema types + verdict |
+| `events.rs` | JSONL |
+| `telemetry.rs` | samples/summary/deltas |
+| `nvml.rs` / `nvml_stub.rs` | NVML |
+| `nvapi.rs` | junction temperature |
+| `aer.rs` | Linux AER |
+| `vk_gpu.rs` | Vulkan device wrapper |
+| `vk_diag.rs` | compute/transfer workers |
+| `shaders.rs` | WGSL |
+| `compute_ref.rs` | CPU references |
+| `cuda/{ffi,patterns,worker}.rs` + `kernels.cu/.ptx` | CUDA test |
+| `codec.rs` | ffmpeg |
+
+`src/hooks.rs` holds the upstream-side event hooks.
+
 ## 3. Process model
 
 ```
