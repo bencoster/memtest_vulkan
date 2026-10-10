@@ -1,7 +1,7 @@
 # BCLL diagnostics extension — design
 
 Branch `bcll/diagnostics` of the `bencoster/memtest_vulkan` fork. See REVIEW.md for the upstream analysis
-and USAGE.md for commands. The report format is in REPORT_SCHEMA.md and `report.schema.json`.
+and USAGE.md for commands. The report format is in SCHEMA.md and `report.schema.json`.
 
 ## 1. Goals and non-goals
 
@@ -28,11 +28,17 @@ and USAGE.md for commands. The report format is in REPORT_SCHEMA.md and `report.
 - **Touch points in upstream files** are kept to a handful of lines:
   1. `main.rs`: `mod hooks; #[cfg(feature="diagnostics")] mod bcll;` and a 3-line dispatch at the top of
      `main()`.
-  2. `main.rs::test_device`: four `hooks::*` calls (started / error / progress / finished) and the
+  2. `main.rs::test_device`: `hooks::*` calls (started / error / progress / finished) and the
      deadline check next to `close::close_requested()`.
-  3. `NamedComputeDevice` gains `pci` (domain:bus:device.function) and `device_uuid` (from
+  3. Correctness fixes from the Codex audit (REVIEW §10), which leave the algorithm unchanged:
+     - memory barriers around each dispatch (R17)
+     - initial-fill mismatches checked and latched (R18)
+     - `hooks::init_failure(msg)` before the two non-interactive init exits (R19)
+  4. `LoadedDevices::drop`: its "Destroying vk instance..." line is suppressed when the diagnostics CLI
+     sets `QUIET_INSTANCE_DROP`, so JSON on stdout stays clean.
+  5. `NamedComputeDevice` gains `pci` (domain:bus:device.function) and `device_uuid` (from
      `VkPhysicalDeviceIDProperties`), filled in the existing properties2 chain.
-  4. `Cargo.toml`: features and optional dependencies.
+  6. `Cargo.toml`: features and optional dependencies.
 
 ## 3. Process model
 
@@ -132,6 +138,10 @@ expose GDDR6X junction temperature on GeForce. The tool calls the undocumented
 - hotspot = channel 1
 - junction = channel 9 on Ampere, 7 on Ada, 2 on Blackwell
 
+`--info` also does one read into `details.thermal` (`hotspot_c_nvapi`, `memory_junction_c_nvapi`,
+`nvapi_channels_c`). It is verified on this rig: 3090 = 10 valid channels, junction channel 9; 4090 =
+8 channels, junction channel 7.
+
 GPUs are matched by PCI bus (`NvAPI_GPU_GetBusId`). Any non-OK status (including
 INCOMPATIBLE_STRUCT_VERSION) disables the source silently. The report marks the source
 `"nvapi_undocumented"`. `--no-nvapi` turns it off. On Linux there is no supported userspace path: NVML
@@ -154,10 +164,28 @@ Events:
 - `memtest_error`: absolute byte range, count *including* all-ones words (corrects R1), and the
   bit histograms.
 - `memtest_progress`, `memtest_finished`.
+- `memtest_error` with mode `INITIAL_FILL`: startup-verification mismatches, which upstream discarded
+  (R18).
+- `memtest_init_failure`: the Vulkan error text of an init failure.
 
-Status comes from the exit code: `RUNTIME_ERRORS` → fail; `RUNTIME_ABORT` after `INITED_OK` →
-incomplete/error. Device-lost on an ECC card plus an ECC uncorrected delta → **fail** with reason
-"uncorrectable ECC".
+**Retry policy (R19).** The orchestrator retries with 400 MiB less only when the init failure is
+OUT_OF_DEVICE/HOST/POOL_MEMORY-class, and at most 8 times. Every attempt is recorded in
+`metrics.allocation_attempts`. DEVICE_LOST, or a failure without a reported reason, stops as INCOMPLETE
+instead of re-exercising a failing card.
+
+**Logging.** The child runs in a per-run working directory. Its `memtest_vulkan.log` is kept next to
+the JSON as `<output>.memtest.log` (avoids the log-rotation race, Codex F8).
+
+**Status** comes from the exit code plus events:
+
+| Condition | Status |
+|---|---|
+| `RUNTIME_ERRORS` or any error event | fail |
+| `RUNTIME_ABORT` after `INITED_OK` | incomplete (`runtime_error`) |
+| Device-lost on an ECC card plus an ECC uncorrected delta | **fail**, reason "uncorrectable ECC" (verdict layer) |
+
+Every test also carries a `termination`: completed, mismatch, runtime_error, device_lost, timed_out,
+crashed, init_failed, cancelled or unsupported.
 
 ### 7.2 Compute (Vulkan; WGSL compiled at build time like upstream)
 Each invocation runs a deterministic chain of `iters` steps:
@@ -213,6 +241,14 @@ Implementation:
 The CPU reference of the pattern functions is unit-tested (`cuda/patterns.rs`); the same constants
 appear in `kernels.cu`.
 
+**Runtime canary.** After every fill, words are read back to the host at both ends, the middle and every
+4 GiB boundary, and compared with the CPU reference. A mismatch is reported as an error
+(`cuda_canary_mismatch`). This proves PTX/CPU parity on the real card and adds a CPU-side check against
+common-mode GPU faults (Codex audit).
+
+**Coverage** also reports `driver_reserved_bytes` (NVML `reserved`). Owner request: tested vs total vs
+driver-reserved.
+
 **Division of labour with BC_LocalLLM `gpu.vram_test` (Python/torch, branch feat/gpu-vram-test).** The
 Python side owns the job-queue integration and card hold/clear/verify/release (`card_hold`, `session`).
 Through its `runner` "external tester hook" it invokes this binary with `--report-json` and ingests the
@@ -233,7 +269,7 @@ Video Codec SDK was rejected: a large native integration for no extra fault cove
 
 ## 8. Report and verdict
 
-Schema `bcll.gpu_diag.report` v1 (REPORT_SCHEMA.md). The verdict uses PASS/FAIL/INCOMPLETE, the same
+Schema `bcll.gpu_diag.report` v1 (SCHEMA.md). The verdict uses PASS/FAIL/INCOMPLETE, the same
 vocabulary as `gpu_diag.record`.
 
 **FAIL** if any of:
@@ -250,6 +286,8 @@ vocabulary as `gpu_diag.record`.
 - link below max **while busy**
 - hardware/thermal slowdown throttling
 - memory junction ≥ 100 °C (GDDR6X throttles near 110 °C)
+- a passing VRAM test that covered < 85 % of VRAM
+- telemetry disabled or unavailable
 
 **INCOMPLETE** if, without a FAIL, any test is incomplete/error (timeout, device lost without ECC
 evidence, worker crash).
@@ -264,10 +302,19 @@ Exit codes:
 | 3 | refused / usage error |
 | 4 | internal error |
 
-## 9. Proposed upstream patches (not applied here, to keep the upstream path byte-identical)
+## 9. Proposed upstream patches
+
+R17, R18 and the R19 reason hook are already applied on this branch as small, self-contained diffs that
+upstream can take as-is. The rest are proposed but not applied:
 
 | Finding | Patch |
 |---|---|
+| R17 / R18 | take this branch's barrier and initial-fill-check diffs (`git log -p -- src/main.rs`) |
+| R19 | retry only OUT_OF_*_MEMORY; report other init failures |
+| R20 | derive the window size from `maxStorageBufferRange` / `minStorageBufferOffsetAlignment`; re-query the real buffer's requirements |
+| R21 | budget = saturating(heapBudget − heapUsage) for the chosen heap |
+| R22 | propagate the child's result bits to the parent's exit code |
+| R16 | print `actual_min..=actual_max`; show an empty range when only all-ones words failed |
 | R1 | `total_errors += actual_ff` |
 | R2 | `err_bitcount[min(one_bits, 31)]`, or widen the array to 33 |
 | R5 | finite fence timeout (for example 10 s) → treat as device hang |

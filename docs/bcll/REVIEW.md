@@ -198,6 +198,49 @@ new flags) so that rebasing onto upstream stays trivial; DESIGN.md lists the exa
    JSON report (R3 partially: per-window ranges plus counts).
 5. Optional Vulkan compute-verification and PCIe-transfer-verification tests, an optional CUDA
    VMM memory test with explicit coverage accounting, and an optional NVENC/NVDEC round trip.
-6. Not changed (to stay upstream-mergeable): the shader, the iteration structure, R2/R4/R5 inside the
-   upstream path. R1 is corrected in the *report* (structured events carry `actual_ff` separately and
-   the parent adds it). Proposed upstream patches for R1/R2/R5 are listed in DESIGN.md §9.
+6. Not changed (to stay upstream-mergeable): the shader, the pattern, the iteration structure, the
+   allocation/budget code, and R2/R4/R5 inside the upstream path.
+   - R1 is corrected in the output: structured events carry `actual_ff` separately and the parent adds it.
+   - Changed in the upstream path, after the Codex reconciliation (§10): correctness fixes R17 (memory
+     barriers) and R18 (startup mismatches latched), plus the `init_failure` reason hook used to fix R19.
+     None alters the algorithm.
+   - Proposed upstream patches: DESIGN.md §9.
+
+## 10. Reconciliation with the independent Codex audit (task 1d541e7c, 2026-10-10)
+
+Codex reviewed the same commit independently. Its report is
+`C:/bcll-wt/agent-chat/1d541e7c831da31d699c/docs/reviews/2026-10-10-memtest-vulkan-source-audit.md`.
+
+| Codex | Topic | This review | Resolution on `bcll/diagnostics` |
+|---|---|---|---|
+| F1 (P1) | No Vulkan memory barriers: a fence wait does not make shader writes visible to the next dispatch or to the host | **Missed. Agree.** | Fixed in the upstream dispatch closure: a HOST\|COMPUTE→COMPUTE barrier before each dispatch and a COMPUTE→HOST barrier after it. The fork's own workers already used host-read barriers. Upstreamable. |
+| F2 (P1) | Mismatches seen while verifying the initial fill are discarded (IOBuf reset before the loop) | **Missed. Agree.** | Fixed: each initial-fill read is checked, logged as `Mode INITIAL_FILL`, emitted as a `memtest_error` event and latched in `RUNTIME_ERRORS`. A later lower-memory retry cannot hide it. Upstreamable. |
+| F3 (P1 ops) | Unbounded waits; selection heuristics; DEVICE_LOST during init retried as memory pressure | R5/R6/R7 agreed; **the retry-on-DEVICE_LOST point was missed** | The child now emits `memtest_init_failure` with the Vulkan error text. The orchestrator retries **only** on OUT_OF_*_MEMORY-class errors, at most 8 times, and records `allocation_attempts`. DEVICE_LOST or an unknown reason stops the test as INCOMPLETE (`device_lost` / `init_failed`). Waits are bounded by the worker watchdog; explicit identity and a display gate replace the heuristics. |
+| F4 (P2) | All-ones words omitted from the total | R1, agreed | Corrected in events/output. Also new: upstream `Display` prints max before min (**R16, missed**); the output shows null for an empty non-FF range instead of reversed sentinels. |
+| F5 (P2) | Window ranges are not derived from `maxStorageBufferRange`; the real buffer's memory requirements are not re-queried | **Missed. Agree.** | Not changed: the upstream allocation code is kept intact. NVIDIA reports a 4 GiB−1 range, so the rig is unaffected. Proposed upstream patch (DESIGN §9). |
+| F6 (P2) | Budget = min(heap−usage, budget) instead of budget−usage | **Missed. Agree.** | Not changed (upstream path). Impact on a fresh worker process is small (usage≈0). Coverage is now reported exactly (tested/total/free/driver-reserved), and a PASS below 85 % coverage raises a warning. Proposed upstream patch. |
+| F7 (P2) | The interactive parent's exit code loses the child's result bits | **Missed. Agree.** | Not applicable to the fork's flow: the orchestrator reads the child's exit code and events directly and publishes conventional exit codes 0-4. Proposed upstream patch. |
+| F8 (P2) | Log rotation race between concurrent writers of `memtest_vulkan.log` | R13 partly | The memtest child runs in a per-run working directory. Its log is kept as `<output>.memtest.log` next to the JSON. |
+| Coverage | ≈94.8 % of an idle 24 GiB card (400 MiB reserve + 880 MiB tail) | R4 agreed (the tail estimate here was 0.4-0.8 GB) | `coverage.tested_bytes` = window_size × count, exact. The CUDA VMM test reaches free − 256 MiB. |
+| Patterns | Not injective (rotl of 4 and 32 both give 64); window 0 is the only retention window, never rotated; no March/inversion families | §3.2 agreed (non-injectivity missed) | Pattern diversity is added in the CUDA engine (own-address 64-bit, moving inversions, walking ones, random). The Vulkan engine is kept upstream-identical by design. Rotating retention windows in Vulkan: proposed upstream. |
+| Common mode | Writer and verifier share the GPU; the CPU sentinel is narrow | Agreed | The CUDA engine adds a CPU-computed canary readback after every fill, at both ends, the middle and every 4 GiB boundary. The transfer test verifies on the CPU. |
+| Terminal states | Distinguish device-lost / timed-out / cancelled / unsupported from a clean pass | Partly (statuses only) | Added `termination` per test (completed, mismatch, runtime_error, device_lost, timed_out, crashed, init_failed, cancelled, unsupported). Telemetry-missing and low-coverage warnings stop a reduced run from reading as a full-card PASS. |
+| Orchestration | Small **Python** supervisor | **Partly disagree** | The per-run supervisor (worker isolation, deadlines, durable JSON, telemetry) lives in this Rust binary, so it works standalone on Windows and Linux. BC_LocalLLM's Python `gpu.vram_test` remains the queue-level supervisor (reservation, card hold/clear, ingestion) and calls this binary. That is the same split Codex asks for, one level up. |
+| Compute | cuBLAS/Tensor/TF32 math belongs in torch; repeated GPU results alone are stress, not correctness | Agree | The Vulkan compute test checks integer lanes bit-exactly against the CPU and FP lanes by cross-SM consensus **plus** a CPU tolerance check. Tensor/cuBLAS checks are left to the Python companion. |
+| Codec | Query capabilities; no silent software fallback | Agree | Uses hardware-only `*_nvenc` / `*_cuvid` (no SW fallback possible). Capability gaps become `unsupported` (encoder/decoder listing + driver messages). SDK capability queries: future work. |
+| Windows WHEA | Correlate WHEA / display-recovery events | Not covered | Out of scope here. BC_LocalLLM's gpu-health-faults work reads the event logs; correlate by the output's timestamps and PCI id. |
+
+Net: Codex's F1, F2, the F3 retry point, F5-F7 and R16 are findings this review missed. The disagreement
+is limited to where the per-run supervisor lives.
+
+### Additional findings (from the reconciliation)
+
+| # | Sev | Where | Finding |
+|---|---|---|---|
+| R16 | Low | `main.rs:309-311` | The `IOBuf` display prints `actual_max..=actual_min` (reversed). When only all-ones words failed, the sentinels print as `0x00000000..=0xFFFFFFFF`. |
+| R17 | P1 | `main.rs:887-929` | No memory dependencies between dispatches or before host reads (Codex F1). |
+| R18 | P1 | `main.rs:931-950`, `1039-1044` | Initial-fill verification results are discarded (Codex F2). |
+| R19 | P2 | `main.rs:471-490`, `1714-1733` | Any pre-init Vulkan failure, including DEVICE_LOST, triggers lower-memory retries (Codex F3). |
+| R20 | P2 | `main.rs:866-871`, `507-520` | No `maxStorageBufferRange` / re-queried requirements (Codex F5). |
+| R21 | P2 | `main.rs:570-585` | Budget arithmetic overestimates the remaining process budget (Codex F6). |
+| R22 | P2 | `main.rs:1916-1919` | The parent's exit code drops the child's result bits (Codex F7). |
